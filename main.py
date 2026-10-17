@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-🎬 Video Generator — Multi-Language Auto Publisher v3.2
+🎬 Video Generator — Multi-Language Auto Publisher v3.4
+
+Changes from v3.3:
+  ✅ 1. _fetch_image_bytes() — يقبل روابط الصفحات (مثل
+        https://ibb.co/xxxx) ويستخرج الصورة المباشرة من og:image.
+  ✅ 2. SPEED_MULTIPLIER["ar"] = 1.0 — بدون تسريع للصوت العربي.
+
+Changes from v3.2:
+  ✅ 1. _download_custom_thumbnail() — تحميل صورة مصغرة مخصصة
+        من رابط في الجدول (عمود thumbnail) — للعربية الطويلة فقط.
+  ✅ 2. process_video() — تحميل الصورة قبل بدء الرندر.
+  ✅ 3. _try_publish_existing() — تحميل الصورة أيضاً في مسار
+        الاستئناف (فيديو مرندر مسبقاً).
+  ✅ 4. إذا فشل التحميل أو كان الحقل فارغاً → التوليد التلقائي القديم.
 
 Changes from v3.1:
   ✅ 1. produce_mixed_audio() — concat silence بدل apad
@@ -12,6 +25,8 @@ Changes from v3.1:
 from __future__ import annotations
 
 import argparse
+import html
+import io
 import json
 import logging
 import re
@@ -20,6 +35,9 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+
+import requests
+from PIL import Image
 
 from db import (
     init_db,
@@ -94,8 +112,11 @@ RENDER_TIMEOUT_SHORT   = 1800
 RENDER_TIMEOUT_LONG_YT = 7200
 RENDER_TIMEOUT_LONG_FB = 7200
 
+# ✅ v3.4 — العربية (الدارجة المغربية): بدون أي تسريع (1.0)
+# الصوت يبقى بطيئاً ومفهوماً. غيّر fr / en إلى 1.0 أيضاً
+# إذا أردت إلغاء التسريع فيهما.
 SPEED_MULTIPLIER: dict[str, float] = {
-    "ar": 1.15,
+    "ar": 1.0,
     "fr": 1.05,
     "en": 1.15,
 }
@@ -2239,6 +2260,9 @@ def _run_long_pipeline(
         else platforms_to_run[0]
     )
 
+    # ✅ v3.3 — الصورة المخصصة (إن وُجدت) حُمِّلت مسبقاً في
+    # process_video بنفس الاسم؛ _generate_video_thumbnail تتخطى
+    # أي PNG موجود، فتُستخدم صورتك تلقائياً.
     thumb_yt = _generate_video_thumbnail(
         record, lang, out_base, content_mode,
         "yt", "", result.get("video_paths_yt", []),
@@ -2475,6 +2499,162 @@ def _run_short_pipeline(
 
 
 # ═══════════════════════════════════════════════════
+# ✅ v3.3 — CUSTOM THUMBNAIL (من رابط في الجدول)
+# ═══════════════════════════════════════════════════
+
+_OG_IMAGE_PATTERNS = (
+    re.compile(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)'
+        r'(?::src)?["\'][^>]*content=["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*'
+        r'(?:property|name)=["\'](?:og:image|twitter:image)'
+        r'(?::src)?["\']',
+        re.IGNORECASE,
+    ),
+)
+
+
+def _fetch_image_bytes(url: str) -> bytes:
+    """
+    ✅ v3.4 — يجلب بايتات الصورة من رابط.
+
+    يدعم نوعين من الروابط:
+      1) رابط مباشر للصورة (https://i.ibb.co/xxx/name.png)
+      2) رابط صفحة (https://ibb.co/xxxx) → يستخرج الرابط
+         المباشر من وسم og:image في الصفحة ثم يحمّله.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(url, timeout=30, headers=headers)
+    r.raise_for_status()
+
+    content_type = (
+        r.headers.get("Content-Type", "").lower()
+    )
+
+    # رابط مباشر لصورة
+    if content_type.startswith("image/"):
+        return r.content
+
+    # رابط صفحة HTML → ابحث عن og:image
+    if "html" in content_type:
+        page = r.text
+        for pattern in _OG_IMAGE_PATTERNS:
+            m = pattern.search(page)
+            if m:
+                direct = html.unescape(m.group(1)).strip()
+                log.info(
+                    "  🔗 Page link → direct image: %s",
+                    direct[:80],
+                )
+                r2 = requests.get(
+                    direct, timeout=30, headers=headers
+                )
+                r2.raise_for_status()
+                return r2.content
+        raise ValueError(
+            "page link has no og:image — use a direct "
+            "image link (.png/.jpg)"
+        )
+
+    # نوع غير معروف: جرّب فتحه كصورة على أي حال
+    return r.content
+
+
+def _download_custom_thumbnail(
+    url:       str,
+    dest_path: str,
+) -> str:
+    """
+    تحميل صورة مصغرة (png/jpg/jpeg) من رابط وحفظها PNG حقيقي
+    بحجم مناسب ليوتيوب (5KB ≤ الحجم ≤ 2MB).
+
+    - يتحقق من الصورة بفتحها فعلياً بـ Pillow (لا يعتمد على الامتداد)
+    - الصور الشفافة تُدمج على خلفية بيضاء (بدل الأسود)
+    - يصغّر فقط إلى 1280×720 كحد أقصى ولا يكبّر
+
+    Returns:
+        مسار الصورة عند النجاح، أو "" عند الفشل
+    """
+    url = (url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return ""
+
+    max_bytes = 2 * 1024 * 1024
+    min_bytes = 5 * 1024
+
+    try:
+        image_bytes = _fetch_image_bytes(url)
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+
+        # دمج الشفافية على خلفية بيضاء
+        if img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info
+        ):
+            rgba       = img.convert("RGBA")
+            background = Image.new(
+                "RGB", rgba.size, (255, 255, 255)
+            )
+            background.paste(rgba, mask=rgba.split()[-1])
+            img = background
+        else:
+            img = img.convert("RGB")
+
+        img.thumbnail((1280, 720))  # يصغّر فقط
+
+        for _ in range(6):
+            img.save(dest_path, "PNG", optimize=True)
+            if _file_size_bytes(dest_path) <= max_bytes:
+                break
+            w, h = img.size
+            img = img.resize(
+                (max(1, int(w * 0.85)), max(1, int(h * 0.85)))
+            )
+
+        size = _file_size_bytes(dest_path)
+        if size < min_bytes or size > max_bytes:
+            raise ValueError(f"bad size: {size} bytes")
+
+        log.info(
+            "  🖼️  Custom thumbnail downloaded (%.0f KB) → %s",
+            size / 1024, Path(dest_path).name,
+        )
+        return dest_path
+
+    except Exception as e:
+        log.warning("  ⚠️  Custom thumbnail failed: %s", e)
+        _safe_unlink(dest_path)
+        return ""
+
+
+def _apply_custom_thumbnail(
+    record:       dict,
+    lang:         str,
+    content_mode: str,
+    out_base:     str,
+) -> str:
+    """
+    ✅ v3.3 — يحمّل الصورة المخصصة (للعربية الطويلة فقط)
+    إذا كان في الجدول رابط. يُرجع المسار أو "".
+    """
+    if content_mode != "long" or lang != "ar":
+        return ""
+
+    custom_url = (record.get("thumbnail") or "").strip()
+    if not custom_url:
+        return ""
+
+    return _download_custom_thumbnail(
+        custom_url,
+        f"{out_base}_long_yt_thumbnail.png",
+    )
+
+
+# ═══════════════════════════════════════════════════
 # PROCESS ONE VIDEO
 # ═══════════════════════════════════════════════════
 
@@ -2580,6 +2760,12 @@ def process_video(
             log.error("  ❌ Audio error: %s", e)
             return False, {}
         return True, {}
+
+    # ✅ v3.3 — تحميل الصورة المصغرة المخصصة من الجدول
+    # (عربي + طويل فقط). إذا فشل → التوليد التلقائي لاحقاً.
+    _apply_custom_thumbnail(
+        record, lang, content_mode, out_base
+    )
 
     mark_render_start(num, lang, content_mode)
 
@@ -2851,6 +3037,11 @@ def _try_publish_existing(
         ),
         "lang":   lang,
     }
+
+    # ✅ v3.3 — تحميل الصورة المخصصة في مسار الاستئناف أيضاً
+    _apply_custom_thumbnail(
+        record, lang, content_mode, out_base
+    )
 
     suffix_yt = (
         "_short_yt" if content_mode == "short" else "_long_yt"
