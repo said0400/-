@@ -1,0 +1,306 @@
+name: 🇸🇦 Arabic Videos (Short + Long)
+
+on:
+  schedule:
+    # ── Shorts (UTC = توقيت مكة − 3 ساعات) ──────────────────
+    - cron: "0 14 * * 0"   # الأحد    05:00 PM مكة (14:00 UTC)
+    - cron: "0 15 * * 1"   # الإثنين  06:00 PM مكة (15:00 UTC)
+    - cron: "0 16 * * 2"   # الثلاثاء 07:00 PM مكة (16:00 UTC)
+    - cron: "0 15 * * 3"   # الأربعاء 06:00 PM مكة (15:00 UTC)
+    - cron: "0 13 * * 4"   # الخميس   04:00 PM مكة (13:00 UTC)
+    - cron: "0 17 * * 6"   # السبت    08:00 PM مكة (17:00 UTC)
+    # ── Long video: الجمعة ───────────────────────────────────
+    - cron: "0 11 * * 5"   # الجمعة   02:00 PM مكة (11:00 UTC)
+
+  workflow_dispatch:
+    inputs:
+      content_mode:
+        description: "نوع المحتوى"
+        required: true
+        default: "short"
+        type: choice
+        options: ["short", "long"]
+      video_number:
+        description: "🎬 Video number (empty = auto next)"
+        required: false
+        default: ""
+        type: string
+      force:
+        description: "⚡ Force re-render?"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      force_ai:
+        description: "🤖 Force re-generate AI?"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      publish_fb:
+        description: "📘 Publish to Facebook?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      publish_yt:
+        description: "📺 Publish to YouTube?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+concurrency:
+  group: video-ar
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION:   "20"
+  TORCH_VERSION:  "2.5.1"
+  PLAYWRIGHT_VERSION: "1.50.0"
+
+jobs:
+  generate:
+    name: 🇸🇦 Generate Arabic Video
+    runs-on: ubuntu-latest
+    # ✅ 350 دقيقة — كافية لأي فيديو مهما كان طوله
+    timeout-minutes: 350
+
+    steps:
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🧹 Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 🔧 Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            ffmpeg libsndfile1 libgomp1 xvfb \
+            fonts-noto fonts-noto-core \
+            fonts-hosny-amiri fonts-sil-scheherazade \
+            libglib2.0-0 libgbm1
+          sudo fc-cache -fv
+
+      - name: 💾 Cache stable-ts models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/stable-ts
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/whisper
+          key: stable-ts-models-v2-${{ runner.os }}
+          restore-keys: stable-ts-models-
+
+      - name: 💾 Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            remotion/node_modules/playwright/.local-browsers
+            remotion/node_modules/playwright-core/.local-browsers
+          key: "playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}"
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: 🔥 Install PyTorch ${{ env.TORCH_VERSION }} (CPU)
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install \
+            torch==${{ env.TORCH_VERSION }} \
+            torchaudio==${{ env.TORCH_VERSION }} \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: 📦 Install openai-whisper
+        run: |
+          pip install "setuptools<81.0.0" wheel
+          pip install openai-whisper==20240930 --no-build-isolation
+          pip install --upgrade setuptools
+
+      - name: 📦 Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: ✅ Verify stable-ts installation
+        run: python -c "import stable_whisper; print('✅ stable-ts OK')"
+
+      - name: 🟢 Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📦 Install Node dependencies
+        working-directory: remotion
+        run: |
+          if [ -f "package-lock.json" ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: 🌐 Install Playwright Chromium (Python + Node.js)
+        run: |
+          echo "🐍 Installing for Python Playwright..."
+          python -m playwright install chromium --with-deps
+          echo "✅ Python Playwright: OK"
+
+          echo ""
+          echo "🟢 Installing for Node.js Playwright..."
+          cd remotion
+          npx playwright install chromium --with-deps
+          cd ..
+          echo "✅ Node.js Playwright: OK"
+
+      - name: 📥 Restore DB
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: vsg-database-ar
+          if_no_artifact_found: ignore
+          search_artifacts: true
+          branch: ${{ github.ref_name }}
+
+      - name: 🇸🇦 Generate + Publish Arabic
+        env:
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY1:         ${{ secrets.GROQ_API_KEY1 }}
+          GROQ_API_KEY2:         ${{ secrets.GROQ_API_KEY2 }}
+          GROQ_API_KEY3:         ${{ secrets.GROQ_API_KEY3 }}
+          GROQ_API_KEY4:         ${{ secrets.GROQ_API_KEY4 }}
+          GROQ_API_KEY5:         ${{ secrets.GROQ_API_KEY5 }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY1:       ${{ secrets.GEMINI_API_KEY1 }}
+          GEMINI_API_KEY2:       ${{ secrets.GEMINI_API_KEY2 }}
+          GEMINI_API_KEY3:       ${{ secrets.GEMINI_API_KEY3 }}
+          GEMINI_API_KEY4:       ${{ secrets.GEMINI_API_KEY4 }}
+          GEMINI_API_KEY5:       ${{ secrets.GEMINI_API_KEY5 }}
+          PEXELS_API_KEY:        ${{ secrets.PEXELS_API_KEY }}
+          PEXELS_API_KEY_1:      ${{ secrets.PEXELS_API_KEY_1 }}
+          PEXELS_API_KEY_2:      ${{ secrets.PEXELS_API_KEY_2 }}
+          PIXABAY_API_KEY:       ${{ secrets.PIXABAY_API_KEY }}
+          PIXABAY_API_KEY_1:     ${{ secrets.PIXABAY_API_KEY_1 }}
+          PIXABAY_API_KEY_2:     ${{ secrets.PIXABAY_API_KEY_2 }}
+          FB_PAGE_ID:            ${{ secrets.FB_PAGE_ID_AR }}
+          FB_PAGE_TOKEN:         ${{ secrets.FB_PAGE_TOKEN_AR }}
+          YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID_AR }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET_AR }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN_AR }}
+          GREEN_API_INSTANCE_ID: ${{ secrets.GREEN_API_INSTANCE_ID }}
+          GREEN_API_TOKEN:       ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_PHONE_NUMBER: ${{ secrets.WHATSAPP_PHONE_NUMBER }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          CURRENT_LANG:          "ar"
+
+        run: |
+          # ── تحديد MODE ──────────────────────────────────────
+          # الجمعة 11:00 UTC (02:00 PM مكة) = فيديو طويل، الباقي Shorts
+          MODE="short"
+          [ "${{ github.event.schedule }}" = "0 11 * * 5" ] && MODE="long"
+
+          # ✅ override من workflow_dispatch
+          INPUT_MODE="${{ github.event.inputs.content_mode }}"
+          [ -n "$INPUT_MODE" ] && MODE="$INPUT_MODE"
+
+          # ── تحديد الملفات حسب MODE ──────────────────────────
+          if [ "$MODE" = "long" ]; then
+            INPUT_FILE="scripts/ar_long.xlsx"
+            OUTPUT_DIR="output_long"
+          else
+            INPUT_FILE="scripts/ar_short.xlsx"
+            OUTPUT_DIR="output"
+          fi
+
+          echo "🚀 Mode: $MODE | Input: $INPUT_FILE | Output: $OUTPUT_DIR"
+
+          # ── بناء FLAGS ──────────────────────────────────────
+          FLAGS="--lang ar --content-mode $MODE --auto-next --platform both"
+
+          # force
+          [ "${{ github.event.inputs.force }}" = "true" ] && \
+            FLAGS="$FLAGS --force"
+
+          # force-ai
+          [ "${{ github.event.inputs.force_ai }}" = "true" ] && \
+            FLAGS="$FLAGS --force-ai"
+
+          # publish flags
+          PUBLISH_FB="${{ github.event.inputs.publish_fb }}"
+          PUBLISH_FB="${PUBLISH_FB:-true}"
+
+          PUBLISH_YT="${{ github.event.inputs.publish_yt }}"
+          PUBLISH_YT="${PUBLISH_YT:-true}"
+
+          # no-publish إذا كلاهما false
+          if [ "$PUBLISH_FB" = "false" ] && [ "$PUBLISH_YT" = "false" ]; then
+            FLAGS="$FLAGS --no-publish"
+          fi
+
+          # video number
+          INPUT_VN="${{ github.event.inputs.video_number }}"
+          [ -n "$INPUT_VN" ] && FLAGS="$FLAGS --video-number $INPUT_VN"
+
+          echo "🏁 FLAGS: $FLAGS"
+
+          python main.py "$INPUT_FILE" --output-dir "$OUTPUT_DIR" $FLAGS
+
+      # ── Upload Artifacts ─────────────────────────────────────
+
+      - name: 📤 Upload final videos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-videos-${{ github.run_number }}
+          path: |
+            output/**/*_published.mp4
+            output/**/*_final.mp4
+            output_long/**/*_published.mp4
+            output_long/**/*_final.mp4
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 📤 Upload thumbnails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-thumbnails-${{ github.run_number }}
+          path: |
+            output/**/*_thumbnail.png
+            output_long/**/*_thumbnail.png
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📤 Upload subtitles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-subtitles-${{ github.run_number }}
+          path: |
+            output/**/*.srt
+            output_long/**/*.srt
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 💾 Save Database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsg-database-ar
+          path: vsg.db
+          retention-days: 90
+          overwrite: true
