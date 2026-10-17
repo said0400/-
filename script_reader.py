@@ -1,5 +1,5 @@
 """
-📋 Script Reader v2.0 — Final Production Edition
+📋 Script Reader v2.1 — Final Production Edition
 
 Features:
   ✅ Auto lang + content_mode detection from filename
@@ -18,6 +18,12 @@ Features:
   ✅ Smart sheet selection for Excel
   ✅ CSV uses _process_rows (no code duplication)
   ✅ DEFAULT_TAG instead of None for missing tags
+
+Changes in v2.1 (NEW):
+  ✅ "thumbnail" column (optional) — رابط صورة مصغرة مخصصة
+     يُقرأ من الجدول ويصل في record["thumbnail"].
+     يُنظَّف من المسافات والاقتباسات، ويُحذَّر إذا لم يكن
+     رابط http/https صالحاً.
 """
 
 from __future__ import annotations
@@ -107,6 +113,12 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "content": [
         "content", "text", "script",
         "محتوى", "النص", "texte", "contenu",
+    ],
+    # ✅ v2.1 — رابط الصورة المصغرة المخصصة (اختياري)
+    "thumbnail": [
+        "thumbnail", "thumbnail_url", "thumb", "thumb_url",
+        "الصورة_المصغرة", "صورة_مصغرة", "رابط_الصورة",
+        "رابط_الصورة_المصغرة",
     ],
 }
 
@@ -261,6 +273,21 @@ def _row_to_dict(
         )
         for field in COLUMN_ALIASES
     }
+
+
+def _clean_thumbnail_url(value: str) -> str:
+    """
+    ✅ v2.1 — تنظيف رابط الصورة المصغرة.
+
+    يزيل المسافات والأسطر الجديدة وعلامات الاقتباس
+    المحيطة بالرابط (شائعة عند النسخ إلى Excel).
+    """
+    if not value:
+        return ""
+    cleaned = str(value).strip()
+    cleaned = cleaned.strip("\"'“”‘’<>")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    return cleaned
 
 
 def _has_content(record: dict) -> bool:
@@ -497,6 +524,7 @@ def _process_rows(
     - يتخطى الصفوف الفارغة
     - يضيف lang و content_mode لكل record
     - يُعطي أرقام تلقائية فريدة
+    - ✅ v2.1: ينظّف رابط thumbnail
     """
     scripts:      list[dict] = []
     auto_counter: int        = 1
@@ -527,6 +555,11 @@ def _process_rows(
         ).strip()
         generic = record.get("content", "").strip()
         record["content"] = lang_content or generic
+
+        # ✅ v2.1 — تنظيف رابط الصورة المصغرة
+        record["thumbnail"] = _clean_thumbnail_url(
+            record.get("thumbnail", "")
+        )
 
         if _is_valid_record(record):
             scripts.append(record)
@@ -689,7 +722,8 @@ def read_scripts(file_path: str) -> list[dict]:
     Returns:
         قائمة السكريبتات — كل dict يحتوي:
             number, title, content, lang, content_mode,
-            ar_content / fr_content / en_content
+            ar_content / fr_content / en_content,
+            thumbnail (رابط الصورة المصغرة — فارغ إن لم يوجد)
 
     Raises:
         FileNotFoundError: إذا الملف غير موجود
@@ -752,6 +786,28 @@ def _check_tags_in_content(record: dict) -> list[str]:
     return warnings
 
 
+def _check_thumbnail_url(record: dict) -> list[str]:
+    """
+    ✅ v2.1 — تحذير إذا كان حقل thumbnail غير فارغ
+    لكنه ليس رابط http/https صالحاً.
+    """
+    warnings: list[str] = []
+    num  = record.get("number", "?")
+    lang = record.get("lang", "ar")
+    mode = record.get("content_mode", "short").upper()
+
+    thumb = (record.get("thumbnail") or "").strip()
+    if thumb and not thumb.lower().startswith(
+        ("http://", "https://")
+    ):
+        warnings.append(
+            f"  ⚠️  #{num} ({lang.upper()}) [{mode}]: "
+            f"thumbnail is not a valid http(s) URL — "
+            f"it will be ignored"
+        )
+    return warnings
+
+
 def _unique_num(num: str, seen: set[str]) -> str:
     """
     ضمان رقم فريد (لا تصادم).
@@ -775,6 +831,7 @@ def validate_scripts(
     - يتحقق من وجود محتوى
     - يكتشف الأرقام المكررة ويعيد تسميتها
     - يُنبّه عن غياب الـ tags
+    - ✅ v2.1: يُنبّه عن رابط thumbnail غير صالح
 
     Returns:
         (valid_scripts, error_messages)
@@ -807,6 +864,10 @@ def validate_scripts(
 
         # تحذيرات الـ tags
         errors.extend(_check_tags_in_content(script))
+
+        # ✅ v2.1 — تحذيرات رابط الصورة المصغرة
+        errors.extend(_check_thumbnail_url(script))
+
         valid.append(script)
 
     return valid, errors
@@ -837,6 +898,10 @@ def _build_language_flags(record: dict) -> list[str]:
         flags.append(
             f"🌐 {lang.upper()} ({tags_count} tags) [{mode}]"
         )
+
+    # ✅ v2.1 — إظهار وجود صورة مصغرة مخصصة
+    if (record.get("thumbnail") or "").strip():
+        flags.append("🖼️ custom thumbnail")
 
     return flags
 
