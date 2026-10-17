@@ -1,9 +1,9 @@
 """
-🎙️ Text-to-Speech via Google Gemini TTS v2.0 — Street Style Edition
+🎙️ Text-to-Speech via Google Gemini TTS v2.1 — Street Style Edition
 
 Features:
   ✅ Per-language voices (different voice for each lang)
-  ✅ Saudi Arabic street style (Charon)
+  ✅ Moroccan Arabic (Darija) — slow & clear (Charon)
   ✅ Parisian French street style (Puck)
   ✅ American Gen Z street style (Fenrir)
   ✅ Authentic dialect prompting
@@ -18,6 +18,12 @@ Features:
   ✅ Merges ALL audio chunks (no truncated audio!)
   ✅ Compatible with google-genai 0.x and 1.x
   ✅ Reliable MIME → extension mapping
+
+Changes in v2.1 (NEW):
+  ✅ العربية = الدارجة المغربية (بدل اللهجة السعودية)
+  ✅ العربية: وتيرة بطيئة وواضحة دائماً (PACE OVERRIDE يتجاوز
+     تعليمات الوسوم التي تطلب سرعة أعلى مثل urgency/shock)
+  ✅ نطق ق = 'q' (مغربي) بدل 'g' (سعودي)
 """
 
 from __future__ import annotations
@@ -58,7 +64,7 @@ FFPROBE_TIMEOUT = 15
 
 # Words per minute (per language — for truncation detection)
 WPM_BY_LANG: dict[str, int] = {
-    "ar": 140,   # Arabic: slower
+    "ar": 120,   # Arabic (Darija): slow & clear
     "fr": 180,   # French: medium
     "en": 160,   # English: standard
 }
@@ -94,7 +100,7 @@ RATE_LIMIT_KEYWORDS = (
 
 VOICES: dict[str, str] = {
     "algenib":  "Algenib",
-    "charon":   "Charon",    # ← قوي ذكوري (Saudi)
+    "charon":   "Charon",    # ← قوي ذكوري (Moroccan Darija)
     "puck":     "Puck",      # ← شبابي حيوي (French)
     "fenrir":   "Fenrir",    # ← حاد قوي (American)
     "orus":     "Orus",
@@ -113,58 +119,42 @@ VOICES: dict[str, str] = {
 VOICE_CONFIGS: dict[str, dict] = {
 
     # ═══════════════════════════════════════════════════════════════
-    # 🇸🇦 ARABIC — Saudi Street Style (Khaliji)
+    # 🇲🇦 ARABIC — Moroccan Darija (slow & clear)
     # ═══════════════════════════════════════════════════════════════
     "ar": {
         "voice_key":  "charon",
         "voice_name": "Charon",
         "director_note": (
             "# Audio Profile\n"
-            "Young Saudi Arabian street narrator. "
-            "Confident male voice in his late 20s.\n\n"
+            "Moroccan male narrator in his late 20s. "
+            "Calm, clear, friendly voice.\n\n"
 
             "# Director's Note\n"
-            "Style: Saudi Khaliji street dialect — "
-            "casual, intense, direct, raw.\n"
-            "Pace: Moderate-fast conversational pace "
-            "with dramatic pauses for impact.\n"
-            "Accent: AUTHENTIC Saudi Arabian "
-            "(Najdi/Hijazi blend), street vernacular. "
-            "NOT Egyptian, NOT Levantine, NOT Fusha.\n"
-            "Tone: Confident street wisdom — like a "
-            "trusted big brother giving real advice.\n\n"
-
-            "## Scene\n"
-            "A young Saudi influencer recording a viral "
-            "video on his phone in a Riyadh cafe. "
-            "Speaking directly to his audience as if "
-            "talking to his close friends.\n\n"
+            "Style: Moroccan Arabic (Darija) — natural, warm, "
+            "conversational, like talking to a close friend.\n"
+            "Pace: SLOW and CLEAR. Never rush. Pronounce every "
+            "word fully so the listener understands each one. "
+            "Natural pauses between sentences.\n"
+            "Accent: AUTHENTIC Moroccan Darija (Casablanca / "
+            "Rabat urban accent). NOT Egyptian, NOT Levantine, "
+            "NOT Gulf, NOT Fusha.\n"
+            "Tone: Sincere and engaging, like a trusted "
+            "storyteller.\n\n"
 
             "## Pronunciation Rules\n"
-            "- Pronounce ق as 'g' (Saudi style): "
-            "قال = 'gaal', قلب = 'galb'\n"
-            "- Use Khaliji intonation patterns\n"
-            "- Drop case endings (no حركات الإعراب)\n"
-            "- Natural elision: كيف الحال = 'keef-haalak'\n"
-            "- Emphasize emotional words\n\n"
-
-            "## Sample Context\n"
-            "Motivational/psychology short-form video for "
-            "Saudi/Khaliji youth. The narrator uses Saudi "
-            "street expressions naturally: والله، يبيلك، "
-            "خوش، زين، شدة، ولا يهمك، هالشي، عادي، تراني، "
-            "صدق، يا حبيب القلب، تكفى، طيب، شف، اسمع، "
-            "والنبي.\n\n"
+            "- Read EXACTLY as written, in Moroccan Darija.\n"
+            "- Pronounce ق as 'q' (Moroccan style), not 'g'.\n"
+            "- Keep Moroccan rhythm: short vowels are often "
+            "dropped, and consonant clusters are normal.\n"
+            "- Natural Moroccan expressions: واش، بزاف، "
+            "دابا، فين، كيفاش، علاش، ديال، شنو، مزيان.\n\n"
 
             "## Critical Rules\n"
-            "1. Speak EXACTLY as written - no formal "
-            "corrections\n"
-            "2. NEVER use Fusha (formal Arabic)\n"
-            "3. NEVER use Egyptian or Levantine accent\n"
-            "4. Use Saudi 'g' for ق consistently\n"
-            "5. Sound like a real Saudi, not a "
-            "TV presenter\n"
-            "6. Emotional weight on dramatic words"
+            "1. Speak EXACTLY as written - no formal corrections\n"
+            "2. NEVER convert to Fusha (formal Arabic)\n"
+            "3. NEVER use Egyptian, Levantine or Gulf accent\n"
+            "4. SLOW, clear, easy to understand - always\n"
+            "5. Sound like a real Moroccan, not a TV presenter"
         ),
     },
 
@@ -553,9 +543,9 @@ def _get_lang_note(lang: str) -> str:
     """Language-specific reading instruction."""
     notes = {
         "ar": (
-            "Text is in ARABIC (Saudi street dialect). "
-            "Read with AUTHENTIC Saudi Arabian pronunciation. "
-            "Use 'g' for ق. Drop case endings. Sound natural."
+            "Text is in ARABIC (Moroccan Darija). "
+            "Read with AUTHENTIC Moroccan pronunciation. "
+            "Use 'q' for ق. Speak SLOWLY and CLEARLY."
         ),
         "fr": (
             "Text is in FRENCH (Parisian street slang). "
@@ -614,6 +604,34 @@ def _build_tagged_prompt(
     script_text   = _build_script_text(tagged_sentences)
     n             = len(tagged_sentences)
 
+    # ✅ v2.1 — العربية: وتيرة بطيئة وواضحة تتجاوز تعليمات
+    # الوسوم التي تطلب سرعة أعلى (urgency / shock / inspiration...)
+    if lang == "ar":
+        pace_override = (
+            "\n# PACE OVERRIDE (highest priority)\n"
+            "Regardless of any tag instruction above "
+            "(urgent, fast, shock, inspiration...), ALWAYS "
+            "speak at a SLOW, CLEAR, easy-to-understand pace. "
+            "Express emotion through tone and emphasis, "
+            "NOT through speed.\n"
+        )
+        pacing_guide = (
+            f"# Pacing Guide ({n} sentences)\n"
+            "- Keep a SLOW, CLEAR pace from the first to the "
+            "last sentence\n"
+            "- Emotion comes from tone and emphasis, not speed\n"
+            "- Short natural pauses between sentences\n"
+            "- Last sentence: Deliver with complete conviction"
+        )
+    else:
+        pace_override = ""
+        pacing_guide = (
+            f"# Pacing Guide ({n} sentences)\n"
+            "- Sentence 1: MAXIMUM energy (hook)\n"
+            "- Middle sentences: Build intensity, vary the rhythm\n"
+            "- Last sentence: Deliver with complete conviction"
+        )
+
     return f"""Read the following transcript with AUTHENTIC street accent and emotion.
 
 {director_note}
@@ -627,11 +645,8 @@ DO NOT speak the tag — read ONLY the text after it.
 CHANGE your voice style for each different tag.
 
 {legend_text}
-
-# Pacing Guide ({n} sentences)
-- Sentence 1: MAXIMUM energy (hook)
-- Middle sentences: Build intensity, vary the rhythm
-- Last sentence: Deliver with complete conviction
+{pace_override}
+{pacing_guide}
 
 # Transcript
 {script_text}
@@ -962,7 +977,12 @@ def synthesize_speech(
     log.info("\n  🎙️  TTS Configuration:")
     log.info("     Voice    : %s (%s)", voice_name, voice_key)
     log.info("     Lang     : %s", lang.upper())
-    log.info("     Style    : Street/Casual (authentic)")
+    log.info(
+        "     Style    : %s",
+        "Moroccan Darija (slow & clear)"
+        if lang == "ar"
+        else "Street/Casual (authentic)",
+    )
     log.info("     Words    : %d", total_words)
     log.info(
         "     Tags     : %s",
