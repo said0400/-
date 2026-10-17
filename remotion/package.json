@@ -1,0 +1,43 @@
+{
+  "name":        "video-renderer",
+  "version":     "2.1.0",
+  "type":        "module",
+  "description": "High-performance video renderer with multi-language support (AR/FR/EN). Built with Playwright + FFmpeg.",
+  "keywords": [
+    "video",
+    "renderer",
+    "playwright",
+    "ffmpeg",
+    "arabic",
+    "french",
+    "english",
+    "reels",
+    "shorts",
+    "youtube",
+    "facebook"
+  ],
+  "author":  "Video Script Generator",
+  "license": "MIT",
+
+  "main": "render.mjs",
+
+  "scripts": {
+    "render":           "node render.mjs",
+    "install-browsers": "npx playwright install chromium --with-deps",
+    "install-deps":     "npm ci",
+    "clean":            "rm -rf node_modules package-lock.json",
+    "test":             "node --check render.mjs && echo '✅ Syntax OK'"
+  },
+
+  "dependencies": {
+    "playwright": "1.50.0"
+  },
+
+  "engines": {
+    "node": ">=20.0.0",
+    "npm":  ">=10.0.0"
+  },
+
+  "os":  ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"]
+}
