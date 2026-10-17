@@ -1,5 +1,5 @@
 """
-🧠 Smart AI Assistant powered by Groq — Final Stable Version v7.6
+🧠 Smart AI Assistant powered by Groq — Final Stable Version v7.8
 
 Changes from v7.5:
   ✅ 1. _fix_trailing_comma_in_string() — فاصلة داخل string
@@ -10,7 +10,7 @@ Changes from v7.5:
   ✅ 6. generate_hashtags() — prompt أصرم + temperature=0.5
   ✅ 7. generate_captions() — prompt أصرم مع ONE line rule
 
-Changes in v7.6 (NEW):
+Changes in v7.6:
   ✅ 8.  REASONING_MODELS + REASONING_TOKEN_MULTIPLIER —
          نضاعف max_tokens تلقائياً لموديلات التفكير (reasoning
          models مثل qwen) عشان ما ينقطع الرد أثناء <think>.
@@ -24,6 +24,12 @@ Changes in v7.6 (NEW):
   ✅ 12. generate_engagement_questions() — try/except + fallback.
   ✅ 13. generate_hashtags() — try/except + fallback.
   ✅ 14. generate_captions() — try/except + fallback.
+
+Changes in v7.8 (NEW):
+  ✅ 15. العربية = الدارجة المغربية: LANG_NAMES["ar"] و
+         STREET_STYLE["ar"] وكل الـ fallbacks العربية
+         (pattern interrupts / engagement questions / CTA)
+         صارت بالدارجة المغربية بدل اللهجة الإماراتية/الخليجية.
 """
 
 from __future__ import annotations
@@ -120,8 +126,9 @@ _VALID_MODES = frozenset({"short", "long"})
 # LANGUAGE MAPS
 # ═══════════════════════════════════════════════════
 
+# ✅ v7.8 — العربية = الدارجة المغربية
 LANG_NAMES: dict[str, str] = {
-    "ar": "Arabic",
+    "ar": "Arabic (Moroccan Darija)",
     "fr": "French",
     "en": "English",
 }
@@ -278,14 +285,15 @@ def _get_topic_examples(content_type: str) -> list[str]:
 # ═══════════════════════════════════════════════════
 
 STREET_STYLE: dict[str, dict] = {
+    # ✅ v7.8 — الدارجة المغربية (بدل اللهجة الإماراتية)
     "ar": {
-        "style_name": "لغة شارع الإمارات العربية المتحدة",
+        "style_name": "الدارجة المغربية",
         "instructions": (
-            "اكتب بأسلوب شباب الإمارات — "
-            "كلمات مثل: والله، يبيلك، ما قصّر، خوش، زين، "
-            "شدة، ولا يهمك، هالشي، عادي، طبعاً. "
-            "مباشر وحماسي كأنك تتكلم مع صاحبك. "
-            "استخدم إيموجي. لا تكتب بالفصحى الرسمية."
+            "اكتب بالدارجة المغربية — "
+            "كلمات مثل: واش، بزاف، دابا، شنو، كيفاش، علاش، "
+            "مزيان، ديال، فين، هاد الشي، صافي، والله. "
+            "أسلوب مباشر وحماسي كأنك تتكلم مع صاحبك. "
+            "استعمل إيموجي. لا تكتب بالفصحى الرسمية."
         ),
         "hashtag_lang": "اكتب hashtags بالعربية والإنجليزية",
     },
@@ -329,24 +337,25 @@ HOOK_FALLBACK_KEYWORD = "person emotional dramatic close up face"
 _HEX_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 _STREET_FALLBACK: dict[str, str] = {
-    "ar": "شاهد الفيديو كاملاً! 🔥",
+    "ar": "شوف الفيديو حتى للآخر! 🔥",
     "fr": "Regarde la vidéo complète ! 🔥",
     "en": "Watch the full video! 🔥",
 }
 
 # ✅ v7.6 — fallback ثابت لعمليات bilingual لما الـ AI يفشل
 # نستخدمهم بدل ما نوقف الفيديو كامل.
+# ✅ v7.8 — العربية بالدارجة المغربية.
 _PATTERN_INTERRUPTS_FALLBACK: dict[str, list[str]] = {
-    "ar": ["ثواني...", "لا تفوّت هذا!", "تخيل بس"],
+    "ar": ["تسنى شوية...", "ما تفوتش هادشي!", "تخيل غير"],
     "fr": ["Attends...", "Incroyable !", "Regarde ça"],
     "en": ["Wait...", "No way!", "Listen up"],
 }
 
 _ENGAGEMENT_QUESTIONS_FALLBACK: dict[str, list[str]] = {
     "ar": [
-        "شو رأيك بهذا؟ 🤔",
-        "صار معك قبل؟ 😮",
-        "تحس إنك تتفق؟ 💭",
+        "شنو رأيك فهادشي؟ 🤔",
+        "وقع ليك هادشي من قبل؟ 😮",
+        "واش كتحس بحالك معايا؟ 💭",
     ],
     "fr": [
         "Qu'en penses-tu ? 🤔",
@@ -2712,8 +2721,8 @@ def generate_custom_hook(
         f"- Maximum 10 words\n"
         f"- Instant curiosity or shock\n"
         f"- Sound like a secret\n\n"
-        f'GOOD Arabic: '
-        f'"90٪ من الناس لا يعرفون هذا السر"\n'
+        f'GOOD Arabic (Moroccan Darija): '
+        f'"90٪ د الناس ما كيعرفوش هاد السر"\n'
         f'GOOD French: '
         f'"Ce que personne ne te dit..."\n'
         f'GOOD English: '
@@ -2840,7 +2849,7 @@ def enrich_record(
     content_mode: str                  = "short",
 ) -> dict:
     """
-    الدالة الرئيسية للإثراء بالـ AI — v7.6
+    الدالة الرئيسية للإثراء بالـ AI — v7.8
 
     ✅ الإصلاحات (v7.5):
       - _fix_multiline_strings()
@@ -2851,13 +2860,16 @@ def enrich_record(
       - generate_hashtags() — temperature=0.5
       - generate_captions() — ONE line rule
 
-    ✅ الإصلاحات الجديدة (v7.6):
+    ✅ الإصلاحات (v7.6):
       - موديلات reasoning (qwen) تاخذ توكنز أكبر تلقائياً
       - اكتشاف القطع أثناء التفكير وتبديل الموديل فوراً
       - MODELS_PRIORITY معاد ترتيبها (non-reasoning أولاً)
       - Pattern Interrupts / Engagement Questions / Hashtags /
         Captions كلها صارت "graceful" — تفشل بهدوء مع fallback
         بدل ما توقف الفيديو كامل
+
+    ✅ الجديد (v7.8):
+      - العربية = الدارجة المغربية في كل النصوص المولَّدة
     """
     _validate_lang(lang)
     _validate_mode(content_mode)
