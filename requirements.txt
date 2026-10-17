@@ -1,0 +1,112 @@
+# ══════════════════════════════════════════════════════════════════════
+# 📦 requirements.txt — Video Script Generator (2026 Edition v3.1)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Python: 3.10+ required (tested on 3.10, 3.11, 3.12)
+#
+# ⚠️  Installation order in GitHub Actions:
+#
+#   1. System dependencies (Ubuntu):
+#      sudo apt-get update
+#      sudo apt-get install -y ffmpeg libgomp1 libsndfile1
+#
+#   2. Upgrade pip + setuptools:
+#      pip install --upgrade pip setuptools wheel
+#
+#   3. Install PyTorch (CPU version):
+#      pip install torch==2.5.1 torchaudio==2.5.1 \
+#         --index-url https://download.pytorch.org/whl/cpu
+#
+#   4. Install openai-whisper (dependency for stable-ts):
+#      pip install "setuptools<81.0.0" wheel
+#      pip install openai-whisper==20240930 --no-build-isolation
+#      pip install --upgrade setuptools
+#
+#   5. Install Python dependencies:
+#      pip install -r requirements.txt
+#
+#   6. Install Node.js dependencies:
+#      cd remotion && npm ci && cd ..
+#
+#   7. Install Playwright browsers (BOTH Python + Node.js):
+#      python -m playwright install chromium --with-deps
+#      cd remotion && npx playwright install chromium --with-deps && cd ..
+#
+#   ⚠️  NOTE: Steps 6+7 are required because render.mjs uses
+#       Node.js Playwright (separate binary from Python Playwright).
+#       Both must be installed independently.
+#
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ── AI Services ──────────────────────────────────────────────────────
+google-genai>=1.10.0,<2.0.0
+groq>=0.15.0,<1.0.0
+
+
+# ── Speech Recognition ───────────────────────────────────────────────
+# Note: requires libgomp1 on Linux (apt install libgomp1)
+# Note: openai-whisper is a dependency of stable-ts (install via step 4)
+stable-ts>=2.18.3,<3.0.0
+faster-whisper>=1.1.0,<2.0.0
+ctranslate2>=4.5.0,<5.0.0
+
+
+# ── HuggingFace Hub (used by stable-ts internally) ───────────────────
+# Note: HF_TOKEN NOT required (only for downloading models)
+huggingface_hub>=0.27.1,<1.0.0
+
+
+# ── Audio Processing ─────────────────────────────────────────────────
+# Note: requires libsndfile1 on Linux (apt install libsndfile1)
+# Note: librosa requires numpy < 2.0 (see Numerical section)
+soundfile>=0.12.1,<1.0.0
+librosa>=0.10.2.post1,<0.12.0
+audioread>=3.0.1,<4.0.0
+
+
+# ── Numerical (PINNED for librosa compatibility) ─────────────────────
+# ⚠️  CRITICAL: numpy MUST be < 2.0
+#    (librosa 0.10.x not compatible with numpy 2.x)
+numpy>=1.24.0,<2.0.0
+scipy>=1.14.1,<2.0.0
+
+
+# ── Image Processing ─────────────────────────────────────────────────
+opencv-python>=4.10.0,<5.0.0
+Pillow>=10.0.0,<12.0.0
+
+
+# ── File & Data ───────────────────────────────────────────────────────
+openpyxl>=3.1.5,<4.0.0
+
+
+# ── Network ───────────────────────────────────────────────────────────
+requests>=2.32.3,<3.0.0
+
+# ⚠️  Python Playwright ONLY — for thumbnail rendering (thumbnail.py)
+# Node.js Playwright is separate: cd remotion && npx playwright install
+# Both must be installed — see step 7 above
+playwright>=1.50.0,<2.0.0
+
+
+# ── Utilities ─────────────────────────────────────────────────────────
+tqdm>=4.67.1,<5.0.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 📋 CHANGELOG
+# ══════════════════════════════════════════════════════════════════════
+#
+# v3.1 (2026):
+#   ✅ Added note: Node.js Playwright must be installed separately
+#   ✅ Updated installation steps (step 7: both Python + Node)
+#
+# v3.0 (2026):
+#   ❌ REMOVED: transformers, tokenizers, pandas, nltk, more-itertools
+#   ✅ ADDED: opencv-python, Pillow
+#   ✅ UPDATED: google-genai 1.0.0 → >=1.10.0
+#   ✅ UPDATED: playwright 1.49.1 → >=1.50.0
+#   ✅ FIXED: numpy 2.2.0 → <2.0.0 (librosa fix)
+#
+# ══════════════════════════════════════════════════════════════════════

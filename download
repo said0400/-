@@ -1,0 +1,314 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 🚫 .gitignore — Video Script Generator v2.0
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Updated for:
+#   ✅ stable-ts (replaced WhisperX)
+#   ✅ Long videos support
+#   ✅ Multi-format scripts
+#   ✅ Gemini thumbnails (Nano Banana)
+#   ✅ OpenCV inpainting
+#   ✅ WhisperX cache files
+#   ✅ New SFX directories
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🔒 Secrets & Environment                             ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+.env
+.env.local
+.env.*.local
+.envrc
+*.env.bak
+
+# Notification rate limit cache
+.notify_rate_limit.json
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🐍 Python                                            ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Build artifacts
+.Python
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+develop-eggs/
+downloads/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.manifest
+*.spec
+
+# Testing & Linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+virtualenv/
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🗄️ Databases                                          ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Database files (never commit — contains sensitive data!)
+# vsg.db is excluded by *.db rule
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🎵 Audio & Video (temporary)                         ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+*.wav
+*.mp3
+*.ogg
+*.aac
+*.m4a
+*.flac
+*.opus
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🖼️ Images (temporary)                                 ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.svg
+*.ico
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       📁 Output Directories                                ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+output/
+output_*/
+reports/
+
+# Temp directories
+tmp/
+temp/
+.tmp/
+vsg_tmp_*/
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🟢 Node.js                                           ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+node_modules/
+remotion/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.yarn-integrity
+.pnp.*
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       📄 Manifests & Reports (temporary)                   ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Temporary manifests (generated during video production)
+*_manifest.json
+*_thumbnail.html
+*thumbnail*.html
+*_words.srt
+*_whisperx_cache.json
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       💻 OS Files                                          ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Icon?
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+ehthumbs.db
+ehthumbs_vista.db
+Thumbs.db
+Thumbs.db:encryptable
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       🛠️ IDEs & Editors                                     ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# VS Code (keep useful settings for team)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.vscode/*.code-snippets
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*.swn
+*.bak
+.netrwhist
+
+# Emacs
+\#*\#
+.\#*
+
+# Cursor
+.cursor/
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       📝 Logs & Cache                                      ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+*.log
+logs/
+
+# Model caches (downloaded by stable-ts, transformers, etc.)
+.cache/
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       ⚙️ Build & Distribution                              ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Playwright
+playwright-report/
+test-results/
+playwright/.cache/
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                       ✅ EXCEPTIONS — Keep These Files                     ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Scripts (Excel files for content)
+!scripts/ar_short.xlsx
+!scripts/fr_short.xlsx
+!scripts/en_short.xlsx
+!scripts/ar_long.xlsx
+!scripts/fr_long.xlsx
+!scripts/en_long.xlsx
+
+# Directory placeholders — Music
+!assets/music/.gitkeep
+!assets/music/motivation/.gitkeep
+!assets/music/cinematic/.gitkeep
+
+# Directory placeholders — Videos
+!assets/videos/.gitkeep
+
+# Directory placeholders — SFX (original)
+!sfx/swoosh/.gitkeep
+!sfx/whoosh/.gitkeep
+!sfx/smart/.gitkeep
+!sfx/transitions/.gitkeep
+
+# Directory placeholders — SFX (new)
+!sfx/opening/.gitkeep
+!sfx/big_transitions/.gitkeep
+!sfx/small_transitions/.gitkeep
+!sfx/particles/.gitkeep
+!sfx/tv_static/.gitkeep
+
+# Static assets (logos, icons, etc.)
+!assets/*.png
+!assets/*.jpg
+!assets/*.svg
+
+# Remotion public assets
+!remotion/public/*.png
+!remotion/public/*.jpg
+!remotion/public/*.svg
+!remotion/public/*.ico
+!remotion/public/manifest.json
+
+# Lock files for reproducible builds
+!remotion/package-lock.json
+!remotion/yarn.lock
+!package-lock.json
