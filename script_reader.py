@@ -1,5 +1,5 @@
 """
-📋 Script Reader v2.1 — Final Production Edition
+📋 Script Reader v2.2 — Final Production Edition
 
 Features:
   ✅ Auto lang + content_mode detection from filename
@@ -19,7 +19,11 @@ Features:
   ✅ CSV uses _process_rows (no code duplication)
   ✅ DEFAULT_TAG instead of None for missing tags
 
-Changes in v2.1 (NEW):
+Changes in v2.2 (NEW):
+  ✅ نص بدون [tags] يُقسَّم إلى جمل/وحدات (حد أقصى 28 كلمة)
+     بدل جملة واحدة ضخمة (كان يكسر الصوت والخلفيات والتوقيت).
+
+Changes in v2.1:
   ✅ "thumbnail" column (optional) — رابط صورة مصغرة مخصصة
      يُقرأ من الجدول ويصل في record["thumbnail"].
      يُنظَّف من المسافات والاقتباسات، ويُحذَّر إذا لم يكن
@@ -66,6 +70,10 @@ _EN_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 # Validation
 MIN_SENTENCE_CHARS = 4
 MIN_SENTENCE_WORDS = 2
+
+# ✅ v2.2 — نص بدون وسوم: يُقسَّم إلى وحدات (جمل) بدل وحدة واحدة
+# ضخمة. أي وحدة أطول من هذا العدد من الكلمات تُقسَّم بالتساوي.
+MAX_UNIT_WORDS = 28
 
 # Display
 PREVIEW_LENGTH   = 58
@@ -367,6 +375,38 @@ def _process_single_sentence(sent: dict) -> dict:
     }
 
 
+def _split_untagged_text(text: str, lang: str) -> list[str]:
+    """
+    ✅ v2.2 — تقسيم نص بدون وسوم إلى وحدات صغيرة.
+
+    1) حسب علامات الترقيم والأسطر الجديدة
+    2) أي وحدة أطول من MAX_UNIT_WORDS تُقسَّم بالتساوي
+
+    المشكلة التي يحلّها: نص كامل بدون [tags] كان يُعامَل كجملة
+    واحدة فيصير: صوت بنبرة واحدة، وكلمات مفتاحية لجملة واحدة،
+    وخلفيات متكررة، وتوقيت عرض النص غير دقيق.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    sentences = split_into_sentences(text, lang) or [text]
+
+    units: list[str] = []
+    for sent in sentences:
+        words = sent.split()
+        if len(words) <= MAX_UNIT_WORDS:
+            units.append(sent.strip())
+            continue
+
+        n_chunks = -(-len(words) // MAX_UNIT_WORDS)   # ceil
+        size     = -(-len(words) // n_chunks)         # ceil
+        for k in range(0, len(words), size):
+            units.append(" ".join(words[k:k + size]))
+
+    return [u for u in units if u]
+
+
 def _process_long_content(
     content: str,
     lang:    str,
@@ -405,12 +445,18 @@ def _process_long_content(
         if not text or len(text) < MIN_SENTENCE_CHARS:
             continue
 
-        result.append(_process_single_sentence({
-            "raw_tag": raw_tag,
-            "text":    text,
-            "line":    line,
-        }))
-        line += 1
+        # ✅ v2.2 — نص بدون وسم → قسّمه إلى جمل
+        units = (
+            _split_untagged_text(text, lang)
+            if not raw_tag else [text]
+        )
+        for unit in units:
+            result.append(_process_single_sentence({
+                "raw_tag": raw_tag,
+                "text":    unit,
+                "line":    line,
+            }))
+            line += 1
 
     log.info(
         "  📝 Long content parsed: %d paragraphs",
@@ -428,11 +474,26 @@ def _process_short_content(
     يستخدم split_into_tagged_sentences للتقسيم على مستوى الجمل.
     """
     tagged = split_into_tagged_sentences(content)
-    result = [
-        _process_single_sentence(sent)
-        for sent in tagged
-        if (sent.get("text") or "").strip()
-    ]
+    result: list[dict] = []
+    line = 1
+    for sent in tagged:
+        text = (sent.get("text") or "").strip()
+        if not text:
+            continue
+        raw_tag = (sent.get("raw_tag") or "").strip()
+
+        # ✅ v2.2 — نص بدون وسم → قسّمه إلى جمل
+        units = (
+            _split_untagged_text(text, lang)
+            if not raw_tag else [text]
+        )
+        for unit in units:
+            result.append(_process_single_sentence({
+                "raw_tag": raw_tag,
+                "text":    unit,
+                "line":    line,
+            }))
+            line += 1
     log.info(
         "  📝 Short content parsed: %d sentences",
         len(result)
