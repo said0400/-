@@ -38,11 +38,11 @@ on:
         type: choice
         options: ["false", "true"]
       publish_fb:
-        description: "📘 Publish to Facebook? (يعمل فقط إذا ENABLE_FACEBOOK=true)"
+        description: "📘 Publish to Facebook?"
         required: true
-        default: "false"
+        default: "true"
         type: choice
-        options: ["false", "true"]
+        options: ["true", "false"]
       publish_yt:
         description: "📺 Publish to YouTube?"
         required: true
@@ -59,13 +59,6 @@ env:
   NODE_VERSION:   "20"
   TORCH_VERSION:  "2.5.1"
   PLAYWRIGHT_VERSION: "1.50.0"
-
-  # ════════════════════════════════════════════════════════
-  # 🎛️ مفتاح فيسبوك (الوحيد الذي تحتاج تغييره)
-  #   "false" = فيديو يوتيوب فقط (لا يُنشأ فيديو فيسبوك ولا يُنشر)
-  #   "true"  = يوتيوب + فيسبوك (النمط القديم --platform both)
-  # ════════════════════════════════════════════════════════
-  ENABLE_FACEBOOK: "false"
 
 jobs:
   generate:
@@ -214,10 +207,6 @@ jobs:
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           CURRENT_LANG:          "ar"
 
-          # ✅ مفتاح فيسبوك: إذا ENABLE_FACEBOOK=false يصير الكود
-          # يتجاهل فيسبوك نهائياً (حتى لو مرّ --platform both)
-          VSG_DISABLE_FACEBOOK: ${{ env.ENABLE_FACEBOOK == 'true' && '0' || '1' }}
-
         run: |
           # ── تحديد MODE ──────────────────────────────────────
           # الجمعة 11:00 UTC (02:00 PM مكة) = فيديو طويل، الباقي Shorts
@@ -237,17 +226,10 @@ jobs:
             OUTPUT_DIR="output"
           fi
 
-          # ── المنصة: يوتيوب فقط أو يوتيوب + فيسبوك ──────────
-          if [ "${{ env.ENABLE_FACEBOOK }}" = "true" ]; then
-            PLATFORM="both"
-          else
-            PLATFORM="yt"
-          fi
-
-          echo "🚀 Mode: $MODE | Input: $INPUT_FILE | Output: $OUTPUT_DIR | Platform: $PLATFORM"
+          echo "🚀 Mode: $MODE | Input: $INPUT_FILE | Output: $OUTPUT_DIR"
 
           # ── بناء FLAGS ──────────────────────────────────────
-          FLAGS="--lang ar --content-mode $MODE --auto-next --platform $PLATFORM"
+          FLAGS="--lang ar --content-mode $MODE --auto-next --platform both"
 
           # force
           [ "${{ github.event.inputs.force }}" = "true" ] && \
@@ -259,20 +241,14 @@ jobs:
 
           # publish flags
           PUBLISH_FB="${{ github.event.inputs.publish_fb }}"
-          PUBLISH_FB="${PUBLISH_FB:-false}"
+          PUBLISH_FB="${PUBLISH_FB:-true}"
 
           PUBLISH_YT="${{ github.event.inputs.publish_yt }}"
           PUBLISH_YT="${PUBLISH_YT:-true}"
 
-          # no-publish: إذا يوتيوب false (وفيسبوك معطّل أو false)
-          if [ "${{ env.ENABLE_FACEBOOK }}" = "true" ]; then
-            if [ "$PUBLISH_FB" = "false" ] && [ "$PUBLISH_YT" = "false" ]; then
-              FLAGS="$FLAGS --no-publish"
-            fi
-          else
-            if [ "$PUBLISH_YT" = "false" ]; then
-              FLAGS="$FLAGS --no-publish"
-            fi
+          # no-publish إذا كلاهما false
+          if [ "$PUBLISH_FB" = "false" ] && [ "$PUBLISH_YT" = "false" ]; then
+            FLAGS="$FLAGS --no-publish"
           fi
 
           # video number
