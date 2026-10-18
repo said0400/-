@@ -1,5 +1,5 @@
 """
-🧠 Smart AI Assistant powered by Groq — Final Stable Version v7.8
+🧠 Smart AI Assistant powered by Groq — Final Stable Version v7.9
 
 Changes from v7.5:
   ✅ 1. _fix_trailing_comma_in_string() — فاصلة داخل string
@@ -25,7 +25,13 @@ Changes in v7.6:
   ✅ 13. generate_hashtags() — try/except + fallback.
   ✅ 14. generate_captions() — try/except + fallback.
 
-Changes in v7.8 (NEW):
+Changes in v7.9 (NEW):
+  ✅ 16. _fix_arabic_punctuation() — الفاصلة العربية (،) داخل JSON.
+  ✅ 17. Power Words: fallback بدل إيقاف الفيديو كاملاً.
+  ✅ 18. اقتراح الوسوم بالذكاء الاصطناعي يشتغل فعلاً للجمل بلا وسم
+         (tag_source == "needs_ai").
+
+Changes in v7.8:
   ✅ 15. العربية = الدارجة المغربية: LANG_NAMES["ar"] و
          STREET_STYLE["ar"] وكل الـ fallbacks العربية
          (pattern interrupts / engagement questions / CTA)
@@ -41,6 +47,7 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 from typing import Any, Optional
 
 from groq import Groq
@@ -712,6 +719,16 @@ def _fix_unquoted_array_values(text: str) -> str:
     )
 
 
+def _fix_arabic_punctuation(text: str) -> str:
+    """
+    ✅ v7.9 — الفاصلة العربية (،) والفاصلة المنقوطة (؛) بين عناصر
+    JSON. بعض الموديلات تكتب: ["فيك"، "الفيقة"] فيفشل json.loads.
+    """
+    text = re.sub(r'"\s*[،؛]\s*"', '", "', text)
+    text = re.sub(r'"\s*[،؛]\s*(?=[\n\]\}])', '"', text)
+    return text
+
+
 def _apply_all_fixes(text: str) -> str:
     """
     ✅ v7.5 — تطبيق كل الإصلاحات بالترتيب الصحيح.
@@ -723,6 +740,7 @@ def _apply_all_fixes(text: str) -> str:
     4. unquoted array values
     5. double quotes زائدة أخيراً
     """
+    text = _fix_arabic_punctuation(text)
     text = _fix_multiline_strings(text)
     text = _fix_trailing_comma_in_string(text)
     text = _fix_unclosed_quotes(text)
@@ -1517,6 +1535,19 @@ def _filter_power_words(
     return result
 
 
+def _fallback_power_words(
+    content: str,
+    count:   int = 10,
+) -> list[str]:
+    """✅ v7.9 — أكثر الكلمات تكراراً (≥4 أحرف) من النص نفسه."""
+    tokens = re.findall(r"[\w\u0600-\u06FF]{4,}", content or "")
+    freq   = Counter(t for t in tokens)
+    return _filter_power_words(
+        [w for w, _ in freq.most_common(count * 2)],
+        count,
+    )
+
+
 def generate_power_words(
     content: str,
     context: dict,
@@ -1551,23 +1582,33 @@ def generate_power_words(
         f'Example: ["word1","word2","word3"]'
     )
 
-    raw    = _call_groq(
-        prompt,
-        max_tokens     = 300,
-        temperature    = 0.6,
-        operation_name = (
-            f"Power Words ({lang.upper()})"
-        ),
-    )
-    words  = _parse_json_response(
-        raw, list, "Power Words"
-    )
-    result = _filter_power_words(words, count)
+    # ✅ v7.9 — فشل Power Words لا يوقف الفيديو: نستخدم fallback
+    result: list[str] = []
+    try:
+        raw    = _call_groq(
+            prompt,
+            max_tokens     = 300,
+            temperature    = 0.6,
+            operation_name = (
+                f"Power Words ({lang.upper()})"
+            ),
+        )
+        words  = _parse_json_response(
+            raw, list, "Power Words"
+        )
+        result = _filter_power_words(words, count)
+    except Exception as e:
+        log.warning(
+            "  ⚠️  Power Words AI failed: %s "
+            "— using fallback", str(e)[:120],
+        )
 
     if len(result) < 3:
-        raise AIEnrichmentError(
-            f"❌ Power Words: only {len(result)} valid"
-        )
+        result = _fallback_power_words(content, count)
+        if len(result) < 3:
+            raise AIEnrichmentError(
+                f"❌ Power Words: only {len(result)} valid"
+            )
 
     log.info(
         "  ✅ Power Words (%s): %d words",
@@ -2791,9 +2832,15 @@ def _handle_tag_suggestions(
     if not tagged:
         return
 
+    # ✅ v7.9 — script_reader يضع DEFAULT_TAG مع tag_source="needs_ai"
+    # للجمل بلا وسم؛ كان الشرط القديم (final_tag is None) لا يتحقق
+    # أبداً فلا يشتغل اقتراح الوسوم بالذكاء الاصطناعي.
     tags_needed = [
         s for s in tagged
-        if s.get("final_tag") is None
+        if (
+            s.get("final_tag") is None
+            or s.get("tag_source") == "needs_ai"
+        )
     ]
     if not tags_needed:
         return
