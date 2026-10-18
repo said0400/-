@@ -2,6 +2,10 @@
 """
 🎬 Video Generator — Multi-Language Auto Publisher v3.5
 
+Changes from v3.5:
+  ✅ process_tagged_content يستلم content_mode، والكاش يُعتبر قديماً
+     إذا اختلف عدد الجمل، ولا تُولَّد صورة مصغرة لفيديو فاشل.
+
 Changes from v3.4:
   ✅ 1. _align_script_to_timings() — الكلمات المعروضة = نص السكريبت،
         وWhisper للتوقيت فقط (يحل عدم تطابق النص مع الصوت).
@@ -486,6 +490,14 @@ def _is_cache_stale(
 
     # ✅ مقارنة النص الفعلي كلمة بكلمة، ماشي فقط عدد الجمل/tags
     if tagged:
+        # ✅ v3.6 — اختلاف عدد الجمل (مثلاً كاش قديم بجملة واحدة
+        # لنص بلا وسوم صار الآن مقسَّماً) = كاش قديم
+        if len(tagged) != len(cached_tagged):
+            log.info(
+                "  🔄 Cache stale: %d sentences vs %d cached",
+                len(tagged), len(cached_tagged),
+            )
+            return True
         current_text = " ".join(
             (s.get("text") or "").strip()
             for s in tagged
@@ -2907,7 +2919,7 @@ def process_video(
         return False, {}
 
     tagged = process_tagged_content(
-        content, lang=lang
+        content, lang=lang, content_mode=content_mode
     )
     if not tagged:
         log.error(
@@ -3049,9 +3061,11 @@ def _generate_thumbnails(
     args:          argparse.Namespace,
     content_mode:  str,
     platform:      str,
+    failed_nums:   set | None = None,
 ) -> None:
     if args.script_only or args.no_video:
         return
+    failed_nums = failed_nums or set()
 
     thumbnail_queue: list[tuple[str, str]] = []
     plat_for_thumb = (
@@ -3060,6 +3074,11 @@ def _generate_thumbnails(
 
     for record in valid:
         num      = record["number"]
+
+        # ✅ v3.6 — لا نولّد صورة مصغرة لفيديو فشل إنتاجه
+        if str(num) in failed_nums:
+            continue
+
         out_base = str(
             Path(args.output_dir).resolve() /
             f"video_{num}_{args.lang}"
@@ -3517,6 +3536,7 @@ def main() -> None:
     success        = 0
     failed         = 0
     video_results: dict = {}
+    failed_nums:   set  = set()
 
     for i, record in enumerate(valid, 1):
         log.info("\n[%d/%d]", i, len(valid))
@@ -3552,6 +3572,7 @@ def main() -> None:
                 success += 1
             else:
                 failed += 1
+                failed_nums.add(str(record["number"]))
                 log.error(
                     "  ❌ Video #%s failed",
                     record['number'],
@@ -3566,6 +3587,7 @@ def main() -> None:
             )
             traceback.print_exc()
             failed += 1
+            failed_nums.add(str(record["number"]))
 
     _generate_thumbnails(
         valid         = valid,
@@ -3573,6 +3595,7 @@ def main() -> None:
         args          = args,
         content_mode  = content_mode,
         platform      = platform,
+        failed_nums   = failed_nums,
     )
 
     log.info("\n%s", "═" * 62)
