@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-🎬 Video Generator — Multi-Language Auto Publisher v3.4
+🎬 Video Generator — Multi-Language Auto Publisher v3.5
+
+Changes from v3.4:
+  ✅ 1. _align_script_to_timings() — الكلمات المعروضة = نص السكريبت،
+        وWhisper للتوقيت فقط (يحل عدم تطابق النص مع الصوت).
+  ✅ 2. VSG_DISABLE_FACEBOOK=1 (من YML) → فيديو يوتيوب فقط.
 
 Changes from v3.3:
   ✅ 1. _fetch_image_bytes() — يقبل روابط الصفحات (مثل
@@ -25,10 +30,12 @@ Changes from v3.1:
 from __future__ import annotations
 
 import argparse
+import difflib
 import html
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -283,6 +290,13 @@ def _is_fully_rendered(
 # PUBLISH HELPERS
 # ═══════════════════════════════════════════════════
 
+def _facebook_disabled() -> bool:
+    """✅ v3.5 — VSG_DISABLE_FACEBOOK=1 (من ملف YML) يعطّل فيسبوك."""
+    return os.environ.get(
+        "VSG_DISABLE_FACEBOOK", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _should_publish_yt(
     args: argparse.Namespace,
     lang: str,
@@ -299,6 +313,8 @@ def _should_publish_fb(
     lang: str,
 ) -> bool:
     if args.no_publish or args.script_only or args.no_video:
+        return False
+    if _facebook_disabled():
         return False
     if args.platform not in ("fb", "both"):
         return False
@@ -1990,7 +2006,207 @@ def _run_shared_audio(
 # WHISPERX على الصوت مباشرة
 # ═══════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════
+# ✅ v3.5 — ALIGN SCRIPT TEXT TO WHISPER TIMINGS
+# ═══════════════════════════════════════════════════
+# المشكلة: الكلمات المعروضة على الفيديو كانت تأتي من تفريغ
+# Whisper (يكتب الدارجة بإملاء فصحى/خاطئ) فلا تطابق الصوت
+# المقروء من نصك. الحل: نعرض كلمات السكريبت الأصلي، ونأخذ
+# من Whisper التوقيت فقط (محاذاة تسلسلية + توزيع نسبي).
+
+_AR_DIACRITICS_RE = re.compile(
+    r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]"
+)
+_NON_WORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _norm_word(word: str) -> str:
+    """تطبيع كلمة للمقارنة (حركات، همزات، ألف مقصورة، ترقيم)."""
+    w = _AR_DIACRITICS_RE.sub("", str(word or ""))
+    for a, b in (
+        ("أ", "ا"), ("إ", "ا"), ("آ", "ا"),
+        ("ى", "ي"), ("ة", "ه"), ("ؤ", "و"), ("ئ", "ي"),
+    ):
+        w = w.replace(a, b)
+    w = _NON_WORD_RE.sub("", w)
+    return w.lower().strip()
+
+
+def _align_script_to_timings(
+    aligned:   list[dict],
+    tagged:    list[dict],
+    total_dur: float,
+) -> list[dict]:
+    """
+    يبني aligned جديداً: كلمات = كلمات السكريبت الأصلي،
+    توقيت = من Whisper. مقطع واحد لكل جملة (aligned[i] ↔ tagged[i]).
+    يُرجع [] إذا تعذّر (فيُستخدم aligned الأصلي).
+    """
+    # كلمات Whisper مع التوقيت
+    w_words: list[dict] = []
+    for seg in aligned or []:
+        for w in seg.get("words", []) or []:
+            try:
+                st = float(w.get("start", 0))
+                en = float(w.get("end", st))
+            except (TypeError, ValueError):
+                continue
+            if str(w.get("word", "")).strip():
+                w_words.append({
+                    "word": str(w["word"]).strip(),
+                    "start": st,
+                    "end": max(en, st + 0.05),
+                })
+    w_words.sort(key=lambda x: x["start"])
+
+    # كلمات السكريبت
+    s_words: list[tuple[int, str]] = []
+    for i, sent in enumerate(tagged or []):
+        for tok in (sent.get("text") or "").split():
+            s_words.append((i, tok))
+
+    if not w_words or not s_words:
+        return []
+
+    n_s = len(s_words)
+    n_w = len(w_words)
+    norm_s = [_norm_word(t) for _, t in s_words]
+    norm_w = [_norm_word(w["word"]) for w in w_words]
+
+    sm = difflib.SequenceMatcher(
+        None, norm_s, norm_w, autojunk=False
+    )
+    end_limit = max(float(total_dur or 0), w_words[-1]["end"])
+
+    times: list[tuple[float, float] | None] = [None] * n_s
+    cursor = w_words[0]["start"]
+    matched = 0
+
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for k in range(i2 - i1):
+                w = w_words[j1 + k]
+                times[i1 + k] = (w["start"], w["end"])
+            matched += (i2 - i1)
+            cursor = w_words[j2 - 1]["end"]
+            continue
+
+        n = i2 - i1
+        if n == 0:
+            if j2 > j1:
+                cursor = w_words[j2 - 1]["end"]
+            continue
+
+        if j2 > j1:
+            t0 = w_words[j1]["start"]
+            t1 = w_words[j2 - 1]["end"]
+        else:
+            t0 = cursor
+            t1 = (
+                w_words[j1]["start"]
+                if j1 < n_w else end_limit
+            )
+            if t1 - t0 < 0.12 * n:
+                t1 = t0 + 0.30 * n
+
+        if t1 <= t0:
+            t1 = t0 + 0.10 * n
+
+        weights = [
+            len(norm_s[i1 + k]) + 1 for k in range(n)
+        ]
+        total_w = float(sum(weights))
+        span    = t1 - t0
+        pos     = t0
+        for k in range(n):
+            dur = span * (weights[k] / total_w)
+            times[i1 + k] = (pos, pos + dur)
+            pos += dur
+        cursor = t1
+
+    # ضمان التسلسل (بدون تداخل) وحد أدنى للمدة
+    prev_start = 0.0
+    prev_end   = 0.0
+    fixed: list[tuple[float, float]] = []
+    for idx, t in enumerate(times):
+        st, en = t if t else (prev_end, prev_end + 0.2)
+        if st < prev_end and fixed:
+            ps, pe = fixed[-1]
+            new_pe = max(ps + 0.05, st)
+            fixed[-1] = (ps, min(pe, new_pe))
+            st = max(st, fixed[-1][1])
+        en = max(en, st + 0.08)
+        fixed.append((st, en))
+        prev_start, prev_end = st, en
+
+    # إعادة التجميع حسب الجملة
+    by_sent: dict[int, list[dict]] = {}
+    for (sent_idx, tok), (st, en) in zip(s_words, fixed):
+        by_sent.setdefault(sent_idx, []).append({
+            "word":  tok,
+            "start": round(st, 4),
+            "end":   round(en, 4),
+        })
+
+    result: list[dict] = []
+    for i, sent in enumerate(tagged):
+        words = by_sent.get(i)
+        if not words:
+            continue
+        result.append({
+            "sentence": sent.get("text", ""),
+            "start":    words[0]["start"],
+            "end":      words[-1]["end"],
+            "words":    words,
+            "tag":      sent.get("final_tag", "information"),
+        })
+
+    log.info(
+        "  ✍️  Script→timing alignment: %d words "
+        "(%d exact matches with Whisper, %.0f%%)",
+        n_s, matched, 100.0 * matched / max(1, n_s),
+    )
+    return result
+
+
 def _run_whisperx_on_audio(
+    audio_path: Path,
+    out_base:   str,
+    lang:       str,
+    tagged:     list[dict],
+) -> tuple[list[dict], list[str]]:
+    """
+    ✅ v3.5 — Whisper للتوقيت فقط، والنص المعروض = نص السكريبت.
+    """
+    aligned, sentences = _run_whisperx_raw(
+        audio_path, out_base, lang, tagged
+    )
+    if not aligned:
+        return aligned, sentences
+
+    try:
+        fixed = _align_script_to_timings(
+            aligned,
+            tagged,
+            get_audio_duration(str(audio_path)),
+        )
+    except Exception as e:
+        log.warning(
+            "  ⚠️  Script alignment failed: %s — "
+            "using Whisper text", e,
+        )
+        return aligned, sentences
+
+    if not fixed:
+        return aligned, sentences
+
+    generate_srt(fixed, f"{out_base}.srt")
+    generate_word_srt(fixed, f"{out_base}_words.srt")
+
+    return fixed, [t.get("text", "") for t in tagged]
+
+
+def _run_whisperx_raw(
     audio_path: Path,
     out_base:   str,
     lang:       str,
@@ -3121,6 +3337,20 @@ def main() -> None:
     )
 
     args         = parse_args()
+
+    # ✅ v3.5 — مفتاح من ملف YML لإيقاف فيسبوك نهائياً:
+    #   env:  VSG_DISABLE_FACEBOOK: "1"
+    # يجعل أي --platform fb/both يتحول إلى yt فقط (فيديو يوتيوب واحد).
+    if _facebook_disabled() and args.platform != "yt":
+        log.warning(
+            "  ⚠️  VSG_DISABLE_FACEBOOK=1 — platform "
+            "'%s' → 'yt' (no Facebook video)",
+            args.platform,
+        )
+        args.platform = "yt"
+    if _facebook_disabled():
+        args.publish_fb = False
+
     content_mode = args.content_mode
     platform     = args.platform
 
