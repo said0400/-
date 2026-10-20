@@ -1,12 +1,23 @@
 """
-📹 Stock Video Fetcher v5.1 — Final Production Edition
+📹 Stock Video Fetcher v6.0 — Relevance Edition
 
-Changes from v5.0:
-  ✅ long_portrait orientation fix (Pexels + Pixabay)
-  ✅ _select_pexels_files() — long_portrait → portrait
-  ✅ _filter_pixabay_by_orientation() — long_portrait
-  ✅ _pexels_search() — long_portrait → portrait
-  ✅ fetch_videos_for_script() — orientation log fix
+Changes from v5.2:
+  ✅ 1. Relevance scoring: كل نتيجة Pexels/Pixabay تُقيَّم بمقارنة
+        كلمات البحث "المحتوى" مع وصفها (slug الرابط / tags)،
+        والترتيب بحسب الدرجة بدل shuffle عشوائي.
+  ✅ 2. مراحل بحث: كلمات الجملة (حد صارم 0.5) → كلمات الجملة
+        (حد أدنى 0.01) → كلمات الوسم العامة (صارم ثم أخف).
+  ✅ 3. _search_local: لا اختيار عشوائي أبداً؛ فقط إذا طابق اسم
+        الملف كلمات البحث.
+  ✅ 4. _translate_keyword: تطابق تام فقط (لا استبدال جزئي).
+  ✅ 5. _build_keyword_variants: الاستعلام البسيط أولاً، لاحقات
+        سينمائية في الآخر.
+  ✅ 6. صفحات 1 ثم 2 فقط (بدل صفحات عشوائية حتى 8).
+  ✅ 7. _fill_gaps: الفجوة تُملأ بأقرب مقطع مجاور (بدل عشوائي).
+  ✅ 8. كاش نتائج البحث (thread-safe) لتفادي تكرار طلبات API.
+
+Changes from v5.1:
+  ✅ جلب متوازٍ (ThreadPoolExecutor) + long_portrait orientation fix
 """
 
 from __future__ import annotations
@@ -82,6 +93,12 @@ HTTP_AUTH_ERRORS = (401, 403)
 HTTP_BAD_REQUEST = 400
 
 MOTION_DIFF_THRESHOLD = 0.05
+
+# ✅ v6.0 — Relevance
+STRICT_MIN_SCORE  = 0.5    # نصف كلمات المحتوى على الأقل
+LENIENT_MIN_SCORE = 0.01   # كلمة محتوى واحدة على الأقل
+N_VARIANTS        = 4      # عدد صيغ الاستعلام لكل كلمة
+SEARCH_PAGES_FIRST = (1, 2)
 
 VALID_VIDEO_CONTENT_TYPES = frozenset({
     "video/mp4",
@@ -293,6 +310,100 @@ ABSTRACT_WORDS: frozenset[str] = frozenset({
 
 
 # ═══════════════════════════════════════════════════
+# ✅ v6.0 — RELEVANCE SCORING
+# ═══════════════════════════════════════════════════
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+# كلمات عامة لا تدل على موضوع المشهد → تُستبعد من الحساب
+GENERIC_QUERY_WORDS: frozenset[str] = frozenset({
+    "person", "people", "close", "closeup", "up", "face",
+    "camera", "serious", "cinematic", "dramatic", "moody",
+    "dark", "vertical", "portrait", "widescreen", "footage",
+    "professional", "scene", "shot", "wide", "angle",
+    "lighting", "slow", "motion", "atmospheric", "emotional",
+    "expression", "direct", "talking", "speaking", "intense",
+    "strong", "the", "and", "with", "for", "from", "into",
+    "his", "her", "their", "a", "an", "of", "in", "on", "at",
+})
+
+
+def _stem(word: str) -> str:
+    """تجذير بسيط (نفس الدالة على الطرفين فيتطابقان)."""
+    for suf in ("ing", "ed", "es", "s"):
+        if len(word) > len(suf) + 3 and word.endswith(suf):
+            return word[: -len(suf)]
+    return word
+
+
+def _content_words(text: str) -> list[str]:
+    """كلمات المحتوى (بعد إزالة العامة) مجذَّرة وبدون تكرار."""
+    seen: set[str]  = set()
+    out:  list[str] = []
+    for tok in _WORD_RE.findall((text or "").lower()):
+        if tok in GENERIC_QUERY_WORDS or len(tok) <= 2:
+            continue
+        st = _stem(tok)
+        if st not in seen:
+            seen.add(st)
+            out.append(st)
+    return out
+
+
+def _relevance_score(keyword: str, meta_text: str) -> float:
+    """
+    نسبة كلمات المحتوى في keyword الموجودة في وصف الفيديو.
+    إذا لم تكن هناك كلمات محتوى (كلها عامة) → 1.0 (نقبل).
+    """
+    cw = _content_words(keyword)
+    if not cw:
+        return 1.0
+    meta = {
+        _stem(t)
+        for t in _WORD_RE.findall((meta_text or "").lower())
+    }
+    hits = sum(1 for w in cw if w in meta)
+    return hits / len(cw)
+
+
+def _slug_from_url(url: str) -> str:
+    if not url:
+        return ""
+    last = url.rstrip("/").split("/")[-1]
+    return last.replace("-", " ").replace("_", " ")
+
+
+def _pexels_meta(video: dict) -> str:
+    return _slug_from_url(video.get("url", ""))
+
+
+def _pixabay_meta(hit: dict) -> str:
+    tags = str(hit.get("tags", "") or "").replace(",", " ")
+    slug = _slug_from_url(hit.get("pageURL", ""))
+    return f"{tags} {slug}"
+
+
+# ═══════════════════════════════════════════════════
+# ✅ v6.0 — SEARCH CACHE (thread-safe)
+# ═══════════════════════════════════════════════════
+
+_search_cache:      dict[tuple, list[dict]] = {}
+_search_cache_lock: threading.Lock          = threading.Lock()
+
+
+def _cache_get(key: tuple) -> Optional[list[dict]]:
+    with _search_cache_lock:
+        return _search_cache.get(key)
+
+
+def _cache_set(key: tuple, value: list[dict]) -> None:
+    if not value:
+        return  # لا نخزّن النتائج الفارغة (قد تكون خطأ شبكة)
+    with _search_cache_lock:
+        _search_cache[key] = value
+
+
+# ═══════════════════════════════════════════════════
 # ✅ v5.1 — ORIENTATION HELPER
 # ═══════════════════════════════════════════════════
 
@@ -309,18 +420,13 @@ def _is_portrait_mode(content_mode: str) -> bool:
 # ═══════════════════════════════════════════════════
 
 def _translate_keyword(keyword: str) -> str:
+    """
+    ✅ v6.0 — تطابق تام فقط. كانت النسخة السابقة تستبدل
+    الكلمة بالكامل إذا احتوت أي عبارة من القاموس، فتضيع
+    الكلمة الحرفية المحددة من الذكاء الاصطناعي.
+    """
     kw_lower = keyword.lower().strip()
-
-    if kw_lower in KEYWORD_TRANSLATIONS:
-        return KEYWORD_TRANSLATIONS[kw_lower]
-
-    for poetic, practical in KEYWORD_TRANSLATIONS.items():
-        if poetic in kw_lower:
-            return practical
-        if kw_lower in poetic and len(kw_lower) > 4:
-            return practical
-
-    return keyword
+    return KEYWORD_TRANSLATIONS.get(kw_lower, keyword)
 
 
 def _filter_abstract_keywords(
@@ -352,16 +458,20 @@ def _build_keyword_variants(
     keyword:      str,
     content_mode: str,
     topic:        str = "",
-    n_variants:   int = 6,
+    n_variants:   int = N_VARIANTS,
     chunk_index:  int = 0,
 ) -> list[str]:
+    """
+    ✅ v6.0 — الاستعلام البسيط أولاً (أدق نتائج)، ثم صيغ أقصر
+    وأوسع، واللاحقات السينمائية في الآخر.
+    (chunk_index محفوظ للتوافق ولم يعد يُدوِّر الترتيب.)
+    """
     kw = " ".join(keyword.strip().split())
     if not kw:
         return ["person serious face talking camera"]
 
     practical = _translate_keyword(kw)
 
-    # ✅ Portrait suffixes للـ short و long_portrait
     suffixes = (
         CINEMATIC_SUFFIXES_SHORT
         if _is_portrait_mode(content_mode)
@@ -378,28 +488,24 @@ def _build_keyword_variants(
             seen.add(key)
             all_variants.append(clean)
 
-    for suffix in suffixes:
-        add(f"{practical} {suffix}")
-
+    # 1) الكلمة كما هي
     add(practical)
 
-    if topic and topic.strip():
-        topic_word = topic.strip().split()[0]
-        add(f"{practical} {topic_word}")
-        for suffix in suffixes[:2]:
-            add(f"{practical} {topic_word} {suffix}")
+    # 2) نسخة أقصر (أول 3 كلمات) — أوسع قليلاً
+    words = practical.split()
+    if len(words) > 3:
+        add(" ".join(words[:3]))
 
+    # 3) مع كلمة الموضوع
+    if topic and topic.strip():
+        add(f"{practical} {topic.strip().split()[0]}")
+
+    # 4) الكلمة الأصلية إن اختلفت عن المترجمة
     if kw.lower() != practical.lower():
-        for suffix in suffixes[:3]:
-            add(f"{kw} {suffix}")
         add(kw)
 
-    if all_variants:
-        offset       = chunk_index % len(all_variants)
-        all_variants = (
-            all_variants[offset:] +
-            all_variants[:offset]
-        )
+    # 5) لاحقات سينمائية (آخر خيار)
+    add(f"{practical} {suffixes[0]}")
 
     return all_variants[:n_variants] if all_variants else [
         "person serious face talking camera"
@@ -414,7 +520,6 @@ def _get_tag_fallback(
         tag, TAG_FALLBACK_KEYWORDS["default"]
     )
 
-    # ✅ Portrait suffixes للـ portrait modes
     suffixes = (
         CINEMATIC_SUFFIXES_SHORT
         if _is_portrait_mode(content_mode)
@@ -902,45 +1007,53 @@ def _search_local(
     output_dir:   str,
     session_used: set[str],
     session_lock: threading.Lock,
-    content_mode: str = "short",
+    content_mode: str   = "short",
+    min_score:    float = STRICT_MIN_SCORE,
 ) -> Optional[Path]:
+    """
+    ✅ v6.0 — لا اختيار عشوائي أبداً. فقط ملفات يطابق اسمها
+    كلمات البحث (بدرجة >= min_score، وبحد أدنى 0.5 للمحلي).
+    """
     all_videos = _list_local_videos()
     if not all_videos:
         return None
 
-    kw_clean = keyword.lower().replace(" ", "_")
-    matches  = [
-        v for v in all_videos
-        if kw_clean in v.stem.lower()
-    ]
-    pool = matches if matches else all_videos
-
-    valid_pool: list[Path] = []
-    for v in pool:
-        if str(v) in session_used:
-            continue
-        is_valid, _ = _is_video_valid(v)
-        if is_valid:
-            valid_pool.append(v)
-
-    if not valid_pool:
-        valid_pool = [
-            v for v in pool
-            if str(v) not in session_used
-        ]
-
-    if not valid_pool:
-        valid_pool = pool
-
-    if not valid_pool:
+    if not _content_words(keyword):
         return None
 
-    pick = random.choice(valid_pool)
-    with session_lock:
-        session_used.add(str(pick))
+    threshold = max(min_score, 0.5)
 
-    log.info("    📁 Local: %s", pick.name)
-    return pick
+    scored: list[tuple[float, Path]] = []
+    for v in all_videos:
+        score = _relevance_score(
+            keyword, v.stem.replace("_", " ")
+        )
+        if score >= threshold:
+            scored.append((score, v))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: -x[0])
+
+    for score, v in scored:
+        with session_lock:
+            if str(v) in session_used:
+                continue
+        is_valid, _ = _is_video_valid(v)
+        if not is_valid:
+            continue
+        with session_lock:
+            if str(v) in session_used:
+                continue
+            session_used.add(str(v))
+        log.info(
+            "    📁 Local match (%.2f): %s",
+            score, v.name,
+        )
+        return v
+
+    return None
 
 
 # ═══════════════════════════════════════════════════
@@ -1025,14 +1138,19 @@ def _pexels_search(
     ✅ v5.1 — استدعاء Pexels API.
     Portrait: short + long_portrait → orientation=portrait
     Landscape: long → orientation=landscape
+    ✅ v6.0 — مع كاش.
     """
-    # ✅ الإصلاح الرئيسي
     orientation = (
         "portrait"
         if _is_portrait_mode(content_mode)
         else "landscape"
     )
     size = "large"
+
+    cache_key = ("px", query.lower(), orientation, page)
+    cached    = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     for attempt in range(retries):
         api_key = _get_pexels_key()
@@ -1053,7 +1171,9 @@ def _pexels_search(
                 timeout = API_TIMEOUT,
             )
             r.raise_for_status()
-            return r.json().get("videos", [])
+            videos = r.json().get("videos", [])
+            _cache_set(cache_key, videos)
+            return videos
 
         except requests.exceptions.HTTPError as e:
             status = (
@@ -1102,100 +1222,111 @@ def _search_pexels(
     content_mode: str           = "short",
     topic:        str           = "",
     last_used_id: Optional[str] = None,
+    min_score:    float         = STRICT_MIN_SCORE,
 ) -> Optional[Path]:
+    """
+    ✅ v6.0 — النتائج تُرتَّب بدرجة الصلة (لا shuffle)، وتُرفض
+    النتائج التي درجتها < min_score.
+    """
     if not _get_pexels_key():
         return None
 
     variants = _build_keyword_variants(
         keyword, content_mode, topic,
-        n_variants=6, chunk_index=index,
+        n_variants=N_VARIANTS, chunk_index=index,
     )
     tried_ids: set[str] = set()
 
     for v_idx, query in enumerate(variants):
-        page = (
-            (index * 3 + v_idx) % PEXELS_MAX_PAGE
-        ) + 1
+        pages = SEARCH_PAGES_FIRST if v_idx == 0 else (1,)
 
-        log.info(
-            "    🔎 Pexels [%s] p%d v%d/%d: %r",
-            content_mode, page,
-            v_idx + 1, len(variants), query,
-        )
+        for page in pages:
+            log.info(
+                "    🔎 Pexels [%s] p%d v%d/%d: %r "
+                "(min=%.2f)",
+                content_mode, page,
+                v_idx + 1, len(variants), query,
+                min_score,
+            )
 
-        videos = _pexels_search(
-            query, content_mode, page=page
-        )
-
-        if not videos and page > 1:
             videos = _pexels_search(
-                query, content_mode, page=1
+                query, content_mode, page=page
             )
 
-        videos = [
-            v for v in videos
-            if v.get("duration", 0) >= MIN_DURATION
-        ]
-
-        if not videos:
-            continue
-
-        if len(videos) > 3:
-            top    = videos[:5]
-            rest   = videos[5:]
-            random.shuffle(top)
-            videos = top + rest
-
-        for video in videos[:MAX_VIDEOS_TO_TRY]:
-            vid_id = str(video["id"])
-            sk     = f"px_{vid_id}"
-
-            if vid_id in tried_ids:
-                continue
-            tried_ids.add(vid_id)
-
-            if last_used_id and vid_id == last_used_id:
-                log.debug(
-                    "    ⏭️  Same as last: %s", vid_id
-                )
-                continue
-
-            with session_lock:
-                if sk in session_used:
+            scored: list[tuple[float, dict]] = []
+            for v in videos:
+                if v.get("duration", 0) < MIN_DURATION:
                     continue
-                session_used.add(sk)
+                sc = _relevance_score(
+                    keyword, _pexels_meta(v)
+                )
+                if sc >= min_score:
+                    scored.append((sc, v))
 
-            if is_video_used(vid_id, "pexels"):
-                with session_lock:
-                    session_used.discard(sk)
+            if not scored:
                 continue
 
-            files = _select_pexels_files(
-                video.get("video_files", []),
-                content_mode,
-            )
-            if not files:
-                with session_lock:
-                    session_used.discard(sk)
-                continue
+            # ترتيب مستقر: الأعلى صلة أولاً، وعند التعادل
+            # يبقى ترتيب Pexels (الأكثر صلة بحسب محركهم)
+            scored.sort(key=lambda x: -x[0])
 
-            url = files[0].get("link", "")
-            if not url:
-                with session_lock:
-                    session_used.discard(sk)
-                continue
+            for sc, video in scored[:MAX_VIDEOS_TO_TRY]:
+                vid_id = str(video["id"])
+                sk     = f"px_{vid_id}"
 
-            dest = Path(output_dir) / (
-                f"{index:03d}_{sub}_px_{vid_id}_"
-                f"{_safe_name(keyword)}.mp4"
-            )
+                if vid_id in tried_ids:
+                    continue
+                tried_ids.add(vid_id)
 
-            if _download(url, dest):
-                mark_video_used(vid_id, keyword, "pexels")
-                return dest
-            else:
+                if last_used_id and vid_id == last_used_id:
+                    log.debug(
+                        "    ⏭️  Same as last: %s", vid_id
+                    )
+                    continue
+
                 with session_lock:
-                    session_used.discard(sk)
+                    if sk in session_used:
+                        continue
+                    session_used.add(sk)
+
+                if is_video_used(vid_id, "pexels"):
+                    with session_lock:
+                        session_used.discard(sk)
+                    continue
+
+                files = _select_pexels_files(
+                    video.get("video_files", []),
+                    content_mode,
+                )
+                if not files:
+                    with session_lock:
+                        session_used.discard(sk)
+                    continue
+
+                url = files[0].get("link", "")
+                if not url:
+                    with session_lock:
+                        session_used.discard(sk)
+                    continue
+
+                dest = Path(output_dir) / (
+                    f"{index:03d}_{sub}_px_{vid_id}_"
+                    f"{_safe_name(keyword)}.mp4"
+                )
+
+                log.info(
+                    "    🎯 Pexels candidate (score %.2f): %s",
+                    sc, _pexels_meta(video)[:60],
+                )
+
+                if _download(url, dest):
+                    mark_video_used(
+                        vid_id, keyword, "pexels"
+                    )
+                    return dest
+                else:
+                    with session_lock:
+                        session_used.discard(sk)
 
     return None
 
@@ -1273,6 +1404,11 @@ def _pixabay_search(
     page:    int = 1,
     retries: int = 3,
 ) -> list[dict]:
+    cache_key = ("pb", query.lower(), page)
+    cached    = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     for attempt in range(retries):
         api_key = _get_pixabay_key()
         if not api_key:
@@ -1283,7 +1419,7 @@ def _pixabay_search(
                 PIXABAY_API_URL,
                 params={
                     "key":        api_key,
-                    "q":          query,
+                    "q":          query[:100],
                     "video_type": "film",
                     "per_page":   PIXABAY_PER_PAGE,
                     "page":       page,
@@ -1293,7 +1429,9 @@ def _pixabay_search(
                 timeout=API_TIMEOUT,
             )
             r.raise_for_status()
-            return r.json().get("hits", [])
+            hits = r.json().get("hits", [])
+            _cache_set(cache_key, hits)
+            return hits
 
         except requests.exceptions.HTTPError as e:
             status = (
@@ -1344,94 +1482,104 @@ def _search_pixabay(
     content_mode: str           = "short",
     topic:        str           = "",
     last_used_id: Optional[str] = None,
+    min_score:    float         = STRICT_MIN_SCORE,
 ) -> Optional[Path]:
+    """
+    ✅ v6.0 — ترتيب بدرجة الصلة مع tags الفيديو في Pixabay.
+    """
     if not _get_pixabay_key():
         return None
 
     variants = _build_keyword_variants(
         keyword, content_mode, topic,
-        n_variants=6, chunk_index=index + 2,
+        n_variants=N_VARIANTS, chunk_index=index,
     )
     tried_ids: set[str] = set()
 
     for v_idx, query in enumerate(variants):
-        page = (
-            (index * 3 + v_idx + 4) % PIXABAY_MAX_PAGE
-        ) + 1
+        pages = SEARCH_PAGES_FIRST if v_idx == 0 else (1,)
 
-        log.info(
-            "    🔎 Pixabay [%s] p%d v%d/%d: %r",
-            content_mode, page,
-            v_idx + 1, len(variants), query,
-        )
+        for page in pages:
+            log.info(
+                "    🔎 Pixabay [%s] p%d v%d/%d: %r "
+                "(min=%.2f)",
+                content_mode, page,
+                v_idx + 1, len(variants), query,
+                min_score,
+            )
 
-        hits = _pixabay_search(query, page=page)
-        if not hits and page > 1:
-            hits = _pixabay_search(query, page=1)
+            hits = _pixabay_search(query, page=page)
 
-        # ✅ orientation filter (يعرف long_portrait)
-        hits = _filter_pixabay_by_orientation(
-            hits, content_mode
-        )
-        hits = [
-            h for h in hits
-            if h.get("duration", 0) >= MIN_DURATION
-        ]
+            # orientation filter (يعرف long_portrait)
+            hits = _filter_pixabay_by_orientation(
+                hits, content_mode
+            )
 
-        if not hits:
-            continue
-
-        if len(hits) > 3:
-            top  = hits[:5]
-            rest = hits[5:]
-            random.shuffle(top)
-            hits = top + rest
-
-        for hit in hits[:MAX_VIDEOS_TO_TRY]:
-            vid_id = str(hit["id"])
-            sk     = f"pb_{vid_id}"
-
-            if vid_id in tried_ids:
-                continue
-            tried_ids.add(vid_id)
-
-            if last_used_id and vid_id == last_used_id:
-                log.debug(
-                    "    ⏭️  Same as last: %s", vid_id
-                )
-                continue
-
-            with session_lock:
-                if sk in session_used:
+            scored: list[tuple[float, dict]] = []
+            for h in hits:
+                if h.get("duration", 0) < MIN_DURATION:
                     continue
-                session_used.add(sk)
-
-            if is_video_used(vid_id, "pixabay"):
-                with session_lock:
-                    session_used.discard(sk)
-                continue
-
-            url = _select_pixabay_url(
-                hit.get("videos", {}), content_mode
-            )
-            if not url:
-                with session_lock:
-                    session_used.discard(sk)
-                continue
-
-            dest = Path(output_dir) / (
-                f"{index:03d}_{sub}_pb_{vid_id}_"
-                f"{_safe_name(keyword)}.mp4"
-            )
-
-            if _download(url, dest):
-                mark_video_used(
-                    vid_id, keyword, "pixabay"
+                sc = _relevance_score(
+                    keyword, _pixabay_meta(h)
                 )
-                return dest
-            else:
+                if sc >= min_score:
+                    scored.append((sc, h))
+
+            if not scored:
+                continue
+
+            scored.sort(key=lambda x: -x[0])
+
+            for sc, hit in scored[:MAX_VIDEOS_TO_TRY]:
+                vid_id = str(hit["id"])
+                sk     = f"pb_{vid_id}"
+
+                if vid_id in tried_ids:
+                    continue
+                tried_ids.add(vid_id)
+
+                if last_used_id and vid_id == last_used_id:
+                    log.debug(
+                        "    ⏭️  Same as last: %s", vid_id
+                    )
+                    continue
+
                 with session_lock:
-                    session_used.discard(sk)
+                    if sk in session_used:
+                        continue
+                    session_used.add(sk)
+
+                if is_video_used(vid_id, "pixabay"):
+                    with session_lock:
+                        session_used.discard(sk)
+                    continue
+
+                url = _select_pixabay_url(
+                    hit.get("videos", {}), content_mode
+                )
+                if not url:
+                    with session_lock:
+                        session_used.discard(sk)
+                    continue
+
+                dest = Path(output_dir) / (
+                    f"{index:03d}_{sub}_pb_{vid_id}_"
+                    f"{_safe_name(keyword)}.mp4"
+                )
+
+                log.info(
+                    "    🎯 Pixabay candidate (score %.2f): %s",
+                    sc, _pixabay_meta(hit)[:60],
+                )
+
+                if _download(url, dest):
+                    mark_video_used(
+                        vid_id, keyword, "pixabay"
+                    )
+                    return dest
+                else:
+                    with session_lock:
+                        session_used.discard(sk)
 
     return None
 
@@ -1457,7 +1605,7 @@ def _extract_video_id(
 
 
 # ═══════════════════════════════════════════════════
-# FALLBACK (Anti-duplication, 4 levels)
+# FALLBACK (آخر حل فقط — لم يعد يُستعمل في المسار العادي)
 # ═══════════════════════════════════════════════════
 
 def _get_fallback_video(
@@ -1466,12 +1614,16 @@ def _get_fallback_video(
     last_used:    Optional[Path]     = None,
     session_used: Optional[set[str]] = None,
 ) -> Optional[Path]:
+    """
+    ✅ v6.0 — محفوظة للتوافق. المسار العادي لم يعد يستدعيها
+    (كانت تختار مقطعاً عشوائياً غير مرتبط)، وصارت الفجوات
+    تُملأ بأقرب مقطع مجاور في _fill_gaps.
+    """
     out_path   = Path(output_dir)
     existing   = sorted(out_path.glob("*.mp4"))
     used_paths = session_used or set()
     used_names = {Path(p).name for p in used_paths}
 
-    # Level 1
     pool = [
         f for f in existing
         if (
@@ -1489,27 +1641,6 @@ def _get_fallback_video(
         log.info("    🆕 New fallback: %s", pick.name)
         return pick
 
-    # Level 2
-    local = _list_local_videos()
-    if local:
-        unused_local = [
-            v for v in local
-            if (
-                str(v) not in used_paths and
-                v.name not in used_names
-            )
-        ]
-
-        if unused_local:
-            pick = random.choice(unused_local)
-            if session_used is not None:
-                session_used.add(str(pick))
-            log.info(
-                "    📁 Local (new): %s", pick.name
-            )
-            return pick
-
-    # Level 3
     pool = [
         f for f in existing
         if (
@@ -1517,7 +1648,6 @@ def _get_fallback_video(
             _safe_size(f) > MIN_FILE_BYTES
         )
     ]
-
     if pool:
         pick = random.choice(pool)
         log.warning(
@@ -1525,7 +1655,6 @@ def _get_fallback_video(
         )
         return pick
 
-    # Level 4
     if existing:
         pick = random.choice(existing)
         log.warning(
@@ -1538,7 +1667,7 @@ def _get_fallback_video(
 
 
 # ═══════════════════════════════════════════════════
-# GAP FILLING
+# GAP FILLING (✅ v6.0 — nearest neighbor)
 # ═══════════════════════════════════════════════════
 
 def _fill_gaps(
@@ -1546,60 +1675,54 @@ def _fill_gaps(
     output_dir:   str,
     session_used: Optional[set[str]] = None,
 ) -> list[Path]:
-    available = [r for r in results if r is not None]
-    local     = _list_local_videos()
-    all_pool  = list(set(available + local))
+    """
+    ✅ v6.0 — الفجوة تُملأ بأقرب مقطع مجاور (الأقرب في الترتيب،
+    وعند التساوي السابق) بدل اختيار عشوائي، لأن المشاهد
+    المتجاورة غالباً من نفس السياق.
+    إذا لم يوجد أي مقطع إطلاقاً → المحلي (إن وجد) وإلا خطأ.
+    """
+    available_idx = [
+        i for i, r in enumerate(results) if r is not None
+    ]
 
-    if not all_pool:
-        raise RuntimeError(
-            "Could not fetch any videos. "
-            "Check PEXELS_API_KEY and PIXABAY_API_KEY."
-        )
+    if not available_idx:
+        local = _list_local_videos()
+        if not local:
+            raise RuntimeError(
+                "Could not fetch any videos. "
+                "Check PEXELS_API_KEY and PIXABAY_API_KEY."
+            )
+        for i in range(len(results)):
+            results[i] = random.choice(local)
+        available_idx = list(range(len(results)))
 
-    used_in_gaps: set[Path]      = set()
-    last_used:    Optional[Path] = None
+    final: list[Path] = []
+    filled = 0
 
-    for i in range(len(results)):
-        if results[i] is not None:
-            last_used = results[i]
+    for i, r in enumerate(results):
+        if r is not None:
+            final.append(r)
             continue
 
-        candidates = [
-            v for v in all_pool
-            if v != last_used and v not in used_in_gaps
-        ]
-
-        if not candidates:
-            candidates = [
-                v for v in all_pool if v != last_used
-            ]
-
-        if not candidates:
-            candidates = all_pool
-
-        picked     = random.choice(candidates)
-        results[i] = picked
-        last_used  = picked
-        used_in_gaps.add(picked)
+        nearest = min(
+            available_idx,
+            key=lambda j: (abs(j - i), 0 if j < i else 1),
+        )
+        picked = results[nearest]
+        assert picked is not None
+        final.append(picked)
+        filled += 1
 
         log.info(
-            "  [%d] ♻️  Gap filled: %s",
-            i + 1, picked.name,
+            "  [%d] ♻️  Gap filled from neighbor [%d]: %s",
+            i + 1, nearest + 1, picked.name,
         )
 
-    final = []
-    for i, r in enumerate(results):
-        if r is None:
-            raise RuntimeError(
-                f"Could not fill gap at index {i}"
-            )
-        final.append(r)
-
     unique_count = len(set(final))
-    total_count  = len(final)
     log.info(
-        "  📊 Used %d unique videos out of %d clips",
-        unique_count, total_count,
+        "  📊 Used %d unique videos out of %d clips "
+        "(%d gaps filled)",
+        unique_count, len(final), filled,
     )
 
     return final
@@ -1620,57 +1743,77 @@ def _try_fetch_one(
     tag:          str           = "information",
     last_used_id: Optional[str] = None,
 ) -> Optional[Path]:
+    """
+    ✅ v6.0 — مراحل:
+      1) كلمات الجملة نفسها  — حد صارم (0.5)
+      2) كلمات الجملة نفسها  — حد أدنى (0.01)
+      3) كلمات الوسم العامة   — صارم ثم أدنى
+    كل مرحلة تجرّب الكلمة 1 ثم 2 ثم 3 على (محلي → Pexels → Pixabay).
+    كاش البحث يمنع تكرار طلبات API بين المراحل.
+    """
     clean_kws = _filter_abstract_keywords(keywords)
     if not clean_kws:
         clean_kws = keywords
+    clean_kws = [k.strip() for k in clean_kws if k and k.strip()]
 
-    tag_fallbacks = _get_tag_fallback(tag, content_mode)
-    all_keywords: list[str] = list(clean_kws)
-    for kw in tag_fallbacks[:3]:
-        if kw not in all_keywords:
-            all_keywords.append(kw)
+    tag_fallbacks = [
+        k for k in _get_tag_fallback(tag, content_mode)[:3]
+        if k not in clean_kws
+    ]
 
-    for sub, kw in enumerate(all_keywords):
-        kw = kw.strip()
-        if not kw:
-            continue
+    stages: list[tuple[str, list[str], float]] = []
+    if clean_kws:
+        stages.append(("sentence/strict", clean_kws, STRICT_MIN_SCORE))
+        stages.append(("sentence/lenient", clean_kws, LENIENT_MIN_SCORE))
+    if tag_fallbacks:
+        stages.append(("tag/strict", tag_fallbacks, STRICT_MIN_SCORE))
+        stages.append(("tag/lenient", tag_fallbacks, LENIENT_MIN_SCORE))
 
-        log.info(
-            "  [%d] [%s] Trying (%d/%d): %r",
-            index + 1, tag,
-            sub + 1, len(all_keywords), kw,
-        )
+    sub_counter = 0
 
-        path = _search_local(
-            kw, index, output_dir,
-            session_used, session_lock, content_mode,
-        )
-        if path:
-            return path
+    for stage_name, kw_list, min_score in stages:
+        for kw in kw_list:
+            sub_counter += 1
 
-        path = _search_pexels(
-            kw, index, sub, output_dir,
-            session_used, session_lock,
-            content_mode, topic,
-            last_used_id=last_used_id,
-        )
-        if path:
-            return path
+            log.info(
+                "  [%d] [%s] %s (%d): %r",
+                index + 1, tag, stage_name,
+                sub_counter, kw,
+            )
 
-        path = _search_pixabay(
-            kw, index, sub, output_dir,
-            session_used, session_lock,
-            content_mode, topic,
-            last_used_id=last_used_id,
-        )
-        if path:
-            return path
+            path = _search_local(
+                kw, index, output_dir,
+                session_used, session_lock,
+                content_mode, min_score,
+            )
+            if path:
+                return path
+
+            path = _search_pexels(
+                kw, index, sub_counter, output_dir,
+                session_used, session_lock,
+                content_mode, topic,
+                last_used_id=last_used_id,
+                min_score=min_score,
+            )
+            if path:
+                return path
+
+            path = _search_pixabay(
+                kw, index, sub_counter, output_dir,
+                session_used, session_lock,
+                content_mode, topic,
+                last_used_id=last_used_id,
+                min_score=min_score,
+            )
+            if path:
+                return path
 
     return None
 
 
 # ═══════════════════════════════════════════════════
-# ✅ v5.1 — MAIN FETCH FUNCTION
+# MAIN FETCH FUNCTION
 # ═══════════════════════════════════════════════════
 
 def fetch_videos_for_script(
@@ -1683,18 +1826,14 @@ def fetch_videos_for_script(
     max_workers:           int                  = 3,
 ) -> list[Path]:
     """
-    ✅ v5.2 — جلب الفيديوهات بالتوازي الفعلي (ThreadPoolExecutor).
+    ✅ v6.0 — جلب الفيديوهات بالتوازي مع فحص الصلة.
 
-    ملاحظات التصميم:
-      - IO-bound بالكامل (requests + subprocess ffprobe/ffmpeg)
-        لذلك ThreadPoolExecutor فعّال جداً هنا (الـ GIL يُحرَّر
-        أثناء الشبكة و subprocess).
-      - session_used محمي بالفعل بـ session_lock، وتدوير مفاتيح
-        الـ API محمي بـ _key_lock — آمن للاستخدام من عدة threads.
-      - قيد "تجنب نفس فيديو المقطع السابق مباشرة" (last_used_id)
-        أصبح "أفضل محاولة" (best-effort) بدل ضمان صارم، لأن
-        المقاطع تُنفَّذ بالتوازي فعلياً؛ لا يزال يمنع التكرار عبر
-        session_used + قاعدة البيانات (mark_video_used) بشكل مضمون.
+    - كل مقطع يبحث بكلمات جملته (1→2→3) ثم بكلمات الوسم.
+    - النتائج تُقبل فقط إذا طابق وصفها كلمات البحث (حد صارم
+      ثم أخف)، ولا اختيار عشوائي أبداً.
+    - المقاطع التي لم يُعثر لها على نتيجة تُملأ بأقرب مجاور.
+    - IO-bound بالكامل → ThreadPoolExecutor مناسب؛ session_used
+      محمي بـ session_lock، وتدوير المفاتيح بـ _key_lock.
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1727,7 +1866,8 @@ def fetch_videos_for_script(
         len(pexels_keys), len(pixabay_keys),
     )
     log.info(
-        "     Quality     : HD enforced (Large priority)"
+        "     Relevance   : strict>=%.2f → lenient>=%.2f",
+        STRICT_MIN_SCORE, LENIENT_MIN_SCORE,
     )
     if topic:
         log.info("     Topic       : %s", topic[:50])
@@ -1739,7 +1879,7 @@ def fetch_videos_for_script(
             )
         return "information"
 
-    # ✅ last_used_id مشترك بين الخيوط — best-effort فقط
+    # last_used_id مشترك بين الخيوط — best-effort فقط
     last_used_holder: dict = {"id": None}
     last_used_lock = threading.Lock()
 
@@ -1772,12 +1912,8 @@ def fetch_videos_for_script(
             last_used_id = avoid_id,
         )
 
-        if not path:
-            path = _get_fallback_video(
-                output_dir, i,
-                last_used    = None,
-                session_used = session_used,
-            )
+        # ✅ v6.0 — لا fallback عشوائي هنا؛ الفجوات تُملأ
+        # لاحقاً بأقرب مقطع مجاور (_fill_gaps).
 
         vid_id = _extract_video_id(path) if path else None
         if vid_id:
@@ -1814,15 +1950,16 @@ def fetch_videos_for_script(
                 )
             else:
                 log.warning(
-                    "  [%d/%d] ❌ not found", idx + 1, n
+                    "  [%d/%d] ❌ no relevant video found",
+                    idx + 1, n,
                 )
 
+    found = sum(1 for r in results if r is not None)
     final = _fill_gaps(results, output_dir, session_used)
 
-    success = sum(1 for r in final if r is not None)
     log.info(
-        "\n  ✅ Fetched: %d/%d videos [%s]",
-        success, n, content_mode.upper(),
+        "\n  ✅ Fetched: %d/%d relevant videos [%s]",
+        found, n, content_mode.upper(),
     )
 
     return final
