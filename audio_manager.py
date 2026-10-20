@@ -1,5 +1,14 @@
 """
-🎚️ Professional Background Music & SFX Mixing System v2.0
+🎚️ Professional Background Music & SFX Mixing System v2.1
+
+Changes from v2.0:
+  ✅ 1. الموسيقى أخفض: DEFAULT_MUSIC_VOLUME=0.05 و MUSIC_DUCK_VOICE=0.025
+        + سقف MAX_MUSIC_VOLUME (يمنع أي استدعاء من رفعها).
+  ✅ 2. Opening SFX (المؤثر في بداية الفيديو) أخفض: 0.65 → 0.22
+        مع fade-out ناعم.
+  ✅ 3. إصلاح الـ ducking: ffmpeg volume لا يقبل "t/v|t/v" بل تعبيراً
+        رياضياً، فصار يُبنى تعبير if(lt(t,..)) خطي بين النقاط
+        (_points_to_volume_expr). كان غالباً يفشل ويسقط للـ simple mix.
 
 Features:
   ✅ Auto EQ per language (AR/FR/EN)
@@ -79,19 +88,21 @@ AUDIO_EXTENSIONS = ("*.wav", "*.mp3", "*.WAV", "*.MP3")
 # Timeouts
 FFMPEG_TIMEOUT = 300  # 5 minutes
 
-# Default volumes
-DEFAULT_MUSIC_VOLUME    = 0.12
+# ✅ v2.1 — Default volumes (الموسيقى أخفض، الـ opening أخفض)
+DEFAULT_MUSIC_VOLUME    = 0.05
+MAX_MUSIC_VOLUME        = 0.06   # سقف: أي قيمة أعلى (مثل 0.12 من main.py) تُخفَّض
 DEFAULT_SFX_VOLUME      = 0.35
 DEFAULT_SMART_SFX_VOL   = 0.40
-DEFAULT_OPENING_VOL     = 0.65
+DEFAULT_OPENING_VOL     = 0.22   # كان 0.65
+OPENING_FADE_OUT        = 0.6    # fade-out ناعم لمؤثر البداية
 DEFAULT_BIG_TRANS_VOL   = 0.70
 DEFAULT_SMALL_TRANS_VOL = 0.30
 DEFAULT_PARTICLE_VOL    = 0.25
 DEFAULT_TV_STATIC_VOL   = 0.40
 
-# Music ducking
-MUSIC_DUCK_BIG_TRANS = 0.05
-MUSIC_DUCK_VOICE     = 0.06
+# ✅ v2.1 — Music ducking (المستوى الفعلي أثناء الكلام)
+MUSIC_DUCK_BIG_TRANS = 0.02
+MUSIC_DUCK_VOICE     = 0.025
 
 # Fade settings
 DEFAULT_FADE_IN    = 1.0
@@ -100,7 +111,7 @@ DEFAULT_DUCK_FADE  = 0.3
 FALLBACK_DURATION  = 300.0  # 5 minutes (for Long videos)
 
 # Limits
-MAX_DUCKING_POINTS = 200
+MAX_DUCKING_POINTS = 150
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -804,9 +815,62 @@ def _build_ducking_points(
             len(clean)
         )
         step  = max(1, len(clean) // MAX_DUCKING_POINTS)
+        last  = clean[-1]
         clean = clean[::step]
+        # ✅ v2.1 — تأكد أن النقطة الأخيرة موجودة
+        if clean[-1] != last:
+            clean.append(last)
 
     return clean
+
+
+def _points_to_volume_expr(points: list[str]) -> str:
+    """
+    ✅ v2.1 — تحويل نقاط "t/v" إلى تعبير ffmpeg خطي بين النقاط.
+
+    ffmpeg volume لا يقبل "0/0.12|0.3/0.06"، بل تعبيراً رياضياً
+    في المتغير t. نبني:
+        if(lt(t,t1), v0+(v1-v0)*(t-t0)/(t1-t0),
+        if(lt(t,t2), ..., v_last))
+    """
+    pts: list[tuple[float, float]] = []
+    for p in points:
+        try:
+            t_s, v_s = p.split("/")
+            pts.append((float(t_s), float(v_s)))
+        except (ValueError, IndexError):
+            continue
+
+    pts.sort(key=lambda x: x[0])
+
+    # إزالة الأزمنة المكررة (نحتفظ بالأخفض)
+    uniq: list[tuple[float, float]] = []
+    for t, v in pts:
+        if uniq and abs(uniq[-1][0] - t) < 1e-6:
+            uniq[-1] = (uniq[-1][0], min(uniq[-1][1], v))
+        else:
+            uniq.append((t, v))
+    pts = uniq
+
+    if not pts:
+        return f"{DEFAULT_MUSIC_VOLUME}"
+    if len(pts) == 1:
+        return f"{pts[0][1]:.4f}"
+
+    expr = f"{pts[-1][1]:.4f}"
+    for i in range(len(pts) - 1, 0, -1):
+        t0, v0 = pts[i - 1]
+        t1, v1 = pts[i]
+        dt = t1 - t0
+        if dt <= 1e-6:
+            continue
+        seg = (
+            f"{v0:.4f}+({v1 - v0:.4f})"
+            f"*(t-{t0:.3f})/{dt:.3f}"
+        )
+        expr = f"if(lt(t,{t1:.3f}),{seg},{expr})"
+
+    return expr
 
 
 def _build_ducking_filter(
@@ -827,10 +891,8 @@ def _build_ducking_filter(
             music_volume, duck_volume, fade_time,
             big_transitions=big_transitions,
         )
-        points_str = "|".join(points)
-        return (
-            f"volume='{points_str}':eval=frame"
-        )
+        expr = _points_to_volume_expr(points)
+        return f"volume='{expr}':eval=frame"
 
     except Exception as e:
         log.warning(
@@ -974,14 +1036,23 @@ def mix_audio(
     big_transitions: Optional[list[dict]] = None,
 ) -> Path:
     """Mix صوت مع موسيقى مع ducking ذكي — ✅ FIX جذري لمشكلة القِصَر."""
+    # ✅ v2.1 — سقف لمستوى الموسيقى (يمنع 0.12 القادمة من main.py)
+    if music_volume > MAX_MUSIC_VOLUME:
+        log.info(
+            "  🔉 Music volume capped: %.3f → %.3f",
+            music_volume, MAX_MUSIC_VOLUME,
+        )
+        music_volume = MAX_MUSIC_VOLUME
+
     voice_dur   = _safe_duration(voice_path)
     fade_out_st = max(0.0, voice_dur - fade_out)
 
     log.info(
         "  🎚️  Mixing: voice=%.2fs "
-        "music_vol=%.0f%% lang=%s",
+        "music_vol=%.1f%% duck=%.1f%% lang=%s",
         voice_dur,
         music_volume * 100,
+        MUSIC_DUCK_VOICE * 100,
         lang.upper()
     )
 
@@ -1003,7 +1074,7 @@ def mix_audio(
         aligned          = aligned or [],
         voice_dur        = voice_dur,
         music_volume     = music_volume,
-        duck_volume      = MUSIC_DUCK_VOICE,
+        duck_volume      = min(MUSIC_DUCK_VOICE, music_volume),
         big_transitions  = big_transitions,
     )
 
@@ -1022,7 +1093,7 @@ def mix_audio(
         f"duration=longest:normalize=0[out]"
     )
 
-    success, _ = _run_ffmpeg([
+    success, err1 = _run_ffmpeg([
         "ffmpeg", "-y",
         "-i", voice_path,
         *loop_args,
@@ -1033,6 +1104,12 @@ def mix_audio(
         "-t", f"{voice_dur:.3f}",
         output_path,
     ])
+
+    if not success:
+        log.warning(
+            "  ⚠️  Ducking mix error: %s",
+            (err1 or "")[-300:],
+        )
 
     if used_prerender:
         _safe_unlink(prerender_path)
@@ -1073,8 +1150,12 @@ def mix_audio(
         "  ⚠️  Audio mix failed — trying simple mix..."
     )
 
+    # ✅ v2.1 — في الـ simple mix نستخدم مستوى الـ duck
+    # (الأخفض) لأن الصوت يتكلم أغلب الوقت.
+    simple_vol = min(music_volume, MUSIC_DUCK_VOICE * 1.5)
+
     simple_filter = (
-        f"volume={music_volume},"
+        f"volume={simple_vol},"
         f"afade=t=in:st=0:d={fade_in:.3f},"
         f"afade=t=out:st={fade_out_st:.3f}"
         f":d={fade_out:.3f},"
@@ -1194,18 +1275,31 @@ def build_hook_sfx_track(
     output_path:    str,
     seed:           Optional[int] = None,
 ) -> Optional[Path]:
-    """🪝 بناء مسار Hook SFX."""
+    """🪝 بناء مسار Hook SFX (✅ v2.1: أخفض + fade-out ناعم)."""
     hook_sfx = get_opening_sfx(seed=seed)
     if not hook_sfx:
         return None
 
     log.info("  🪝 Building Hook SFX track...")
 
+    # مدة مؤثر البداية لتحديد موضع الـ fade-out
+    sfx_dur = get_audio_duration(str(hook_sfx))
+    fade_d  = OPENING_FADE_OUT
+    if sfx_dur > 0:
+        fade_d  = min(OPENING_FADE_OUT, max(0.1, sfx_dur / 2))
+        fade_st = max(0.0, sfx_dur - fade_d)
+        fade_filter = (
+            f"afade=t=out:st={fade_st:.3f}:d={fade_d:.3f},"
+        )
+    else:
+        fade_filter = ""
+
     success, _ = _run_ffmpeg([
         "ffmpeg", "-y",
         "-i", str(hook_sfx),
         "-af",
         f"volume={DEFAULT_OPENING_VOL},"
+        f"{fade_filter}"
         f"apad=pad_dur={total_duration}",
         "-t", str(total_duration),
         "-c:a", "pcm_s16le",
@@ -1217,7 +1311,8 @@ def build_hook_sfx_track(
         return None
 
     log.info(
-        "  ✅ Hook SFX built: %s", hook_sfx.name
+        "  ✅ Hook SFX built: %s (vol=%.2f)",
+        hook_sfx.name, DEFAULT_OPENING_VOL,
     )
     return Path(output_path)
 
