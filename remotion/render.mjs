@@ -1,6 +1,16 @@
 // remotion/render.mjs
 // ═══════════════════════════════════════════════════════════════════════════
-// 🎬 Video Renderer — Cinematic Edition v6.1
+// 🎬 Video Renderer — Cinematic Edition v6.2
+//
+// Changes from v6.1:
+//   ✅ 1. حذف عنوان الفيديو (ASS Title + .tc في HTML) — الطويل والقصير.
+//   ✅ 2. إصلاح انحراف التزامن: كل مقطع يُرندَر بمدته + مدة الانتقال
+//        الذي يليه، و xfade offset = مجموع المدد الحقيقية (بدل
+//        dur - XFADE الذي كان يُقصّر الفيديو ويُسبّب تقدّم المقاطع
+//        تدريجياً عن الكلام).
+//   ✅ 3. stateKey لا يعتمد على أطر intro/outro (لا عنوان متحرك) →
+//        عدد PNG أقل ورندر أسرع.
+//   ✅ 4. الفيديو الطويل بمقطع واحد لا يمرّ على xfade.
 //
 // Fixes from v6:
 //   ✅ 1. _finalizeLongVideo() — stream_loop + re-encode للـ video
@@ -181,7 +191,8 @@ process.on("unhandledRejection", (r) => {
 });
 
 console.log(
-  `📌 ${emoji_left} ${display_title} ${emoji_right}`
+  `📌 ${emoji_left} ${display_title} ${emoji_right}` +
+  ` (title overlay disabled)`
 );
 console.log(
   `🌐 Lang:${lang.toUpperCase()} | Mode:${mode} | ` +
@@ -849,12 +860,22 @@ function buildLongBgVideo(
     process.exit(1);
   }
 
+  // ✅ v6.2 — هل سنستعمل xfade؟ (نفس شرط التفرّع لاحقاً)
+  // إذا نعم: كل مقطع (عدا الأخير) يُرندَر بمدته + XFADE_DUR
+  // حتى لا يقصر الفيديو الكلي وتتقدم المقاطع عن الكلام.
+  const useXfadeLong =
+    clipPlan.length > 1 && clipPlan.length <= 30;
+
   const normalizedClips = [];
 
   for (const clip of clipPlan) {
     const i = clip.index;
-    const d = clip.duration;
     const v = clip.videoPath;
+
+    const isLastClip = i === clipPlan.length - 1;
+    const d = (
+      useXfadeLong && !isLastClip
+    ) ? clip.duration + XFADE_DUR : clip.duration;
 
     const normOut   = join(
       TMP, `ln_${String(i).padStart(3, "0")}.mp4`
@@ -984,7 +1005,14 @@ function buildLongBgVideo(
     `\n✨ Concat: ${normalizedClips.length} clips...`
   );
 
-  if (normalizedClips.length > 30) {
+  // ✅ v6.2 — مقطع واحد: لا حاجة لأي دمج
+  if (normalizedClips.length === 1) {
+    return _finalizeLongVideo(
+      normalizedClips[0], audioPath, outputFile
+    );
+  }
+
+  if (normalizedClips.length > 30 || !useXfadeLong) {
     const listFile  = join(TMP, "long_list.txt");
     const concatRaw = join(TMP, "long_raw.mp4");
     writeConcatFile(listFile, normalizedClips);
@@ -1033,8 +1061,9 @@ function buildLongBgVideo(
       const dur = clipPlan[i]
         ? clipPlan[i].duration : 3.0;
 
-      // ✅ تراكم صحيح
-      cumOff += Math.max(0.001, dur - XFADE_DUR);
+      // ✅ v6.2 — المقطع i مُرندَر بمدة dur + XFADE_DUR،
+      // فالمقطع التالي يبدأ عند مجموع المدد الحقيقية بالضبط.
+      cumOff += Math.max(0.001, dur);
 
       const outLbl =
         i === normalizedClips.length - 2
@@ -1228,15 +1257,10 @@ function buildAssFile() {
   const wordSize  = (
     content_mode === "long" && platform === "yt"
   ) ? 70 : 85;
-  const titleSize = (
-    content_mode === "long" && platform === "yt"
-  ) ? 36 : 46;
 
   const wordMarginV  = Math.floor(HEIGHT * 0.40);
-  const titleMarginV = (
-    content_mode === "long" && platform === "yt"
-  ) ? 30 : 400;
 
+  // ✅ v6.2 — لا يوجد ستايل Title ولا حدث Title (العنوان محذوف)
   const header = [
     "[Script Info]",
     "ScriptType: v4.00+",
@@ -1260,11 +1284,6 @@ function buildAssFile() {
     `&HB4000000,-1,0,0,0,100,100,0,0,1,4,2,` +
     `2,80,80,${wordMarginV},1`,
 
-    `Style: Title,${fontName},${titleSize},` +
-    `&H00FFFFFF,&H000000FF,&H00000000,` +
-    `&H80000000,-1,0,0,0,100,100,0,0,1,2,1,` +
-    `8,40,40,${titleMarginV},1`,
-
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, " +
@@ -1272,15 +1291,6 @@ function buildAssFile() {
   ].join("\r\n");
 
   const events = [];
-
-  events.push(
-    `Dialogue: 0,${secondsToAssTime(0)},` +
-    `${secondsToAssTime(effectiveDuration)},` +
-    `Title,,0,0,0,,` +
-    escapeAssText(
-      `${emoji_left} ${display_title} ${emoji_right}`
-    )
-  );
 
   if (aligned && aligned.length > 0) {
     let wordCount = 0;
@@ -1569,6 +1579,11 @@ function buildClipPlan() {
       index:      i,
       start:      parseFloat(offset.toFixed(3)),
       duration:   parseFloat(d.toFixed(3)),
+      // ✅ v6.2 — المدة المُرندَرة = المدة الحقيقية + مدة الانتقال
+      // التالي (يُمتصّ بالـ xfade فتبقى المدة الصافية = المدة الحقيقية)
+      renderDuration: parseFloat(
+        (d + (trans ? trans.duration : 0)).toFixed(3)
+      ),
       videoPath:  validVideos[i % validVideos.length],
       isHook:     i === 0 && has_hook && isShort,
       section:    sec,
@@ -1658,6 +1673,13 @@ function mergeAudio(
 // ═══════════════════════════════════════════════════════════════════════════
 // SHORT: CONCAT WITH TRANSITIONS
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// ✅ v6.2 — كل clip في processedClips مُرندَر بمدة
+//   (dur الحقيقية + مدة الانتقال الذي يليه). لذلك:
+//   - داخل المجموعة: offset للمقطع j = مجموع dur الحقيقية للمقاطع قبله.
+//   - طول ملف المجموعة = مجموع dur + مدة الانتقال الكبير التالي.
+//   - بين المجموعات: offset = طول ما دُمج - مدة الانتقال
+//     (= مجموع dur الحقيقية) فيبقى الإجمالي = مدة الصوت.
 
 function concatClipsWithTransitions(
   processedClips, clipPlan
@@ -1709,10 +1731,18 @@ function concatClipsWithTransitions(
   for (const group of groups) {
     const clips = group.clips;
 
+    // الطول المتوقع للملف = مجموع المدد + ذيل الانتقال الكبير
+    const sumDur = clips.reduce(
+      (s, c) => s + c.dur, 0
+    );
+    const tailDur = group.nextTrans
+      ? group.nextTrans.duration : 0;
+
     if (clips.length === 1) {
       groupOutputs.push({
         file:  clips[0].clip,
-        dur:   clips[0].dur,
+        dur:   probeDuration(clips[0].clip) ||
+               (sumDur + tailDur),
         trans: group.nextTrans,
       });
       continue;
@@ -1726,11 +1756,8 @@ function concatClipsWithTransitions(
     let lastTrans = null;
 
     for (let i = 1; i < clips.length; i++) {
-      const prevDur = Math.max(
-        clips[i - 1].dur, X + 0.05
-      );
-      // ✅ تراكم صحيح
-      cumOff += Math.max(0.001, prevDur - X);
+      // ✅ v6.2 — offset = مجموع المدد الحقيقية للمقاطع السابقة
+      cumOff += Math.max(0.001, clips[i - 1].dur);
 
       const xft = pickTransition(
         lastTrans, clips[i - 1].tag
@@ -1748,9 +1775,6 @@ function concatClipsWithTransitions(
     }
 
     const groupOut = join(TMP, `grp_${gIdx}.mp4`);
-    const totDur   =
-      clips.reduce((s, c) => s + c.dur, 0) -
-      X * (clips.length - 1);
 
     const r = runFFmpeg([
       "-y",
@@ -1779,7 +1803,10 @@ function concatClipsWithTransitions(
 
     groupOutputs.push({
       file:  groupOut,
-      dur:   Math.max(totDur, 0.5),
+      dur:   Math.max(
+        probeDuration(groupOut) || (sumDur + tailDur),
+        0.5
+      ),
       trans: group.nextTrans,
     });
     gIdx++;
@@ -1801,6 +1828,8 @@ function concatClipsWithTransitions(
       || pickTransition(null, "default");
     const transDur  = (trans && trans.duration)
       || XFADE_DUR;
+    // ✅ mergedDur يشمل ذيل الانتقال، فالطرح يعطي
+    // مجموع المدد الحقيقية بالضبط.
     const offset    = Math.max(
       0.1, mergedDur - transDur
     );
@@ -2312,6 +2341,7 @@ function buildSentenceBoundaryMap() {
 // SHORT: ANIMATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// (محفوظة للتوافق — العنوان محذوف ولم تعد تُستعمل في الرسم)
 function computeTitleAnimation(gf) {
   if (gf < INTRO_FRAMES) {
     const t = gf / INTRO_FRAMES;
@@ -2425,14 +2455,10 @@ const getHookText = () =>
   HOOK_DEFAULTS.en;
 
 /**
- * ✅ stateKey مع progress bucket أدق
+ * ✅ v6.2 — لا عنوان متحرك، فلا حاجة لمفتاح مستقل لكل إطار
+ * في أول وآخر ثانية (أقل PNG وأسرع رندر).
  */
 function stateKey(state, gf, ts) {
-  if (gf < INTRO_FRAMES) return `intro_f${gf}`;
-  if (gf >= totalFrames - OUTRO_FRAMES) {
-    return `outro_f${gf}`;
-  }
-
   if (ts) {
     const pb = ts.progress < 0.5 ? "in" : "out";
     const wk = state
@@ -2476,11 +2502,8 @@ function buildHTMLShort(params) {
     ? getFontFamily(word)
     : `"Noto Sans",sans-serif`;
   const la   = word ? getLang(word)  : "en";
-  const td   = getDir(display_title);
-  const tf   = getFontFamily(display_title);
   const ts   = isPower
     ? POWER_STYLE : getWordStyle(tag);
-  const ta   = computeTitleAnimation(globalFrame);
   const wa   = word
     ? computeWordAnimation(progress, ts.scaleMult)
     : { scale: 1, opacity: 0, translateY: 0 };
@@ -2503,9 +2526,6 @@ function buildHTMLShort(params) {
   const ha   = isArabic(ht);
   const hd   = ha ? "rtl" : "ltr";
   const hf   = getFontFamily(ht);
-  const tia  = isArabic(display_title);
-  const tfs  = tia ? 52 : 46;
-  const es   = tia ? 56 : 50;
 
   // ✅ إصلاح v6.1: top ديناميكي يأخذ
   // translateY و scaleMult في الحسبان
@@ -2560,6 +2580,7 @@ function buildHTMLShort(params) {
         `filter:brightness(${ts.brightness});`
       );
 
+  // ✅ v6.2 — لا يوجد .tc (عنوان الفيديو) هنا
   return (
     `<!DOCTYPE html>` +
     `<html lang="${la}"><head>` +
@@ -2584,34 +2605,8 @@ function buildHTMLShort(params) {
     `background:${tr.flashColor};` +
     `opacity:${tr.flashOpacity.toFixed(4)};` +
     `pointer-events:none;z-index:50;}` +
-    `.tc{position:absolute;top:410px;left:50%;` +
-    `width:92%;max-width:980px;` +
-    `direction:${td};text-align:center;` +
-    `z-index:30;` +
-    `transform:translateX(-50%) ` +
-    `translateY(${ta.translateY.toFixed(2)}px);` +
-    `opacity:${ta.opacity.toFixed(4)};}` +
-    `.tc::after{content:'';display:block;` +
-    `margin:16px auto 0;` +
-    `width:120px;height:4px;border-radius:2px;` +
-    `background:linear-gradient(90deg,` +
-    `transparent,#FF1744,transparent);` +
-    `opacity:${ta.opacity.toFixed(4)};}` +
-    `.tt{font-family:${tf};font-size:${tfs}px;` +
-    `font-weight:900;color:#FFF;` +
-    `display:inline-flex;align-items:center;` +
-    `justify-content:center;gap:14px;` +
-    `line-height:1.3;direction:${td};` +
-    `-webkit-text-stroke:2px rgba(0,0,0,0.8);` +
-    `paint-order:stroke fill;` +
-    `text-shadow:` +
-    `0 0 30px rgba(255,23,68,0.6),` +
-    `0 4px 20px rgba(0,0,0,0.9),` +
-    `2px 2px 0 rgba(0,0,0,0.8);}` +
-    `.te{font-size:${es}px;` +
-    `-webkit-text-stroke:0;}` +
     `.hb{position:absolute;` +
-    `top:${tia ? "290px" : "270px"};` +
+    `top:${ha ? "290px" : "270px"};` +
     `left:50%;transform:translateX(-50%);` +
     `background:linear-gradient(135deg,` +
     `rgba(220,0,0,0.95),rgba(160,0,0,0.95));` +
@@ -2638,11 +2633,6 @@ function buildHTMLShort(params) {
     `<div class="ot"></div>` +
     `<div class="ob"></div>` +
     `<div class="flash"></div>` +
-    `<div class="tc"><div class="tt">` +
-    `<span class="te">${emoji_left}</span>` +
-    `<span>${esc(display_title)}</span>` +
-    `<span class="te">${emoji_right}</span>` +
-    `</div></div>` +
     (isHook
       ? `<div class="hb">${esc(ht)}</div>`
       : "") +
@@ -2822,7 +2812,8 @@ async function handleBgOnlyMode() {
 
   for (const clip of plan) {
     const i = clip.index;
-    const d = clip.duration;
+    // ✅ v6.2 — نُرندر بالمدة + مدة الانتقال التالي
+    const d = clip.renderDuration;
     const v = clip.videoPath;
     const h = clip.isHook;
     process.stdout.write(
@@ -2897,7 +2888,7 @@ async function handleWordsOnlyMode() {
     mkdirSync(fd, { recursive: true });
     const ep =
       cache.get("empty_n") ||
-      cache.get("intro_f0");
+      cache.get("empty_h");
 
     for (let f = 0; f < totalFrames; f++) {
       const ts = bm.get(f) || null;
