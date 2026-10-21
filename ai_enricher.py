@@ -1,5 +1,19 @@
 """
-🧠 Smart AI Assistant powered by Groq — Final Stable Version v7.9
+🧠 Smart AI Assistant powered by Groq — Final Stable Version v8.0
+
+Changes in v8.0 (NEW) — Visual Keywords relevance overhaul:
+  ✅ 1. برومبت الكلمات المفتاحية أُعيد كتابته: يفهم معنى الجملة
+        (دارجة/فرنسية/عربية) ثم يكتب 3 استعلامات إنجليزية مرئية
+        (حرفي → مرادف → أوسع من نفس الموضوع) بدل "person + emotion".
+  ✅ 2. سياق: الجملة السابقة والتالية تُرسلان مع كل جملة.
+  ✅ 3. مفاتيح الرد = رقم الجملة ({"3":[...]}) فلا يختل الترتيب،
+        وقائمة بنفس العدد تُقبل أيضاً.
+  ✅ 4. إعادة محاولة للجمل الفاشلة فقط (KEYWORD_RETRY_ROUNDS)
+        بدل fallback عام للدفعة كلها.
+  ✅ 5. تنظيف الصفوف: حذف placeholders + أمثلة البرومبت + المجرد +
+        غير الإنجليزي، وسدّ النقص من الكلمة الأولى نفسها.
+  ✅ 6. ضمان: len(visual_keywords) == عدد الجمل دائماً.
+  ✅ 7. المثال داخل البرومبت حقيقي (لا kw1/kw2) ويُرفض أي صف ينسخه.
 
 Changes from v7.5:
   ✅ 1. _fix_trailing_comma_in_string() — فاصلة داخل string
@@ -25,7 +39,7 @@ Changes in v7.6:
   ✅ 13. generate_hashtags() — try/except + fallback.
   ✅ 14. generate_captions() — try/except + fallback.
 
-Changes in v7.9 (NEW):
+Changes in v7.9:
   ✅ 16. _fix_arabic_punctuation() — الفاصلة العربية (،) داخل JSON.
   ✅ 17. Power Words: fallback بدل إيقاف الفيديو كاملاً.
   ✅ 18. اقتراح الوسوم بالذكاء الاصطناعي يشتغل فعلاً للجمل بلا وسم
@@ -114,6 +128,15 @@ BATCH_SLEEP         = 2.0
 ANALYSIS_CACHE_SIZE = 50
 
 INTER_OPERATION_SLEEP = 1.0
+
+# ✅ v8.0 — Visual Keywords
+KEYWORD_RETRY_ROUNDS          = 2     # جولات إعادة للجمل الفاشلة فقط
+SENTENCE_CONTEXT_CHARS        = 100   # طول الجملة السابقة/التالية كسياق
+KEYWORDS_TOKENS_PER_SENTENCE  = 70
+KEYWORDS_MIN_TOKENS           = 500
+KEYWORDS_MAX_TOKENS           = 4500
+KEYWORD_MAX_WORDS             = 6
+KEYWORD_MIN_WORDS             = 2
 
 DEFAULT_EMOJI_LEFT   = "🔥"
 DEFAULT_EMOJI_RIGHT  = "💥"
@@ -204,6 +227,16 @@ _PLACEHOLDER_KEYWORD_LITERALS: frozenset[str] = frozenset({
     "placeholder", "n/a", "na", "none", "null",
 })
 
+# ✅ v8.0 — أمثلة البرومبت: إن نسخها الموديل حرفياً نرفضها
+_KEYWORD_EXAMPLE_QUERIES: frozenset[str] = frozenset({
+    "woman typing laptop cafe",
+    "hands typing keyboard close",
+    "freelancer working laptop table",
+    "man counting cash money table",
+    "hands counting dollar bills",
+    "businessman holding money office",
+})
+
 
 def _is_placeholder_keyword(kw: str) -> bool:
     """✅ v7.7 — يكشف كلمات placeholder وهمية زي 'kw1'."""
@@ -211,6 +244,8 @@ def _is_placeholder_keyword(kw: str) -> bool:
     if not normalized:
         return True
     if normalized in _PLACEHOLDER_KEYWORD_LITERALS:
+        return True
+    if normalized in _KEYWORD_EXAMPLE_QUERIES:
         return True
     if _PLACEHOLDER_KEYWORD_RE.match(normalized):
         return True
@@ -1618,86 +1653,279 @@ def generate_power_words(
 
 
 # ═══════════════════════════════════════════════════
-# 4️⃣ VISUAL KEYWORDS
+# 4️⃣ VISUAL KEYWORDS — ✅ v8.0 relevance overhaul
 # ═══════════════════════════════════════════════════
 
-def _generate_visual_keywords_batch(
-    sentences: list[str],
-    title:     str,
-    context:   dict,
-    tags:      list[str],
-    batch_num: int = 1,
-) -> list[list[str]]:
-    n            = len(sentences)
+_NON_ENGLISH_CHARS_RE = re.compile(r"[^A-Za-z0-9\s'\-]")
+
+
+def _clean_keyword_row(raw_row: Any) -> list[str]:
+    """
+    ✅ v8.0 — تنظيف صف كلمات مفتاحية واحد (3 استعلامات).
+
+    - يحذف placeholders وأمثلة البرومبت
+    - يحذف الرموز والحروف غير اللاتينية (الاستعلام لازم إنجليزي)
+    - يقص الاستعلام إلى KEYWORD_MAX_WORDS كلمات كحد أقصى
+    - يشترط KEYWORD_MIN_WORDS كلمات على الأقل
+    - يحذف الكلمات المجردة والمكرر
+    """
+    if not isinstance(raw_row, list):
+        return []
+
+    cands: list[str] = []
+    for k in raw_row[:6]:
+        s = _NON_ENGLISH_CHARS_RE.sub(" ", str(k))
+        s = " ".join(s.split())
+        if not s or _is_placeholder_keyword(s):
+            continue
+        words = s.split()
+        if len(words) < KEYWORD_MIN_WORDS:
+            continue
+        s = " ".join(words[:KEYWORD_MAX_WORDS])
+        cands.append(s)
+
+    cands = _filter_abstract_keywords(cands)
+
+    out:  list[str] = []
+    seen: set[str]  = set()
+    for c in cands:
+        key = c.lower()
+        if key in seen or _is_placeholder_keyword(c):
+            continue
+        seen.add(key)
+        out.append(c)
+    return out[:3]
+
+
+def _pad_keyword_row(row: list[str]) -> list[str]:
+    """
+    ✅ v8.0 — سدّ النقص (إن وُجد كلمة واحدة أو اثنتان) من الكلمة
+    الأولى نفسها، وليس بعبارة عامة، حتى يبقى الاستعلام مرتبطاً.
+    """
+    row = list(row)
+    if not row:
+        return row
+
+    first   = row[0]
+    first_w = first.split()
+    derived: list[str] = []
+
+    if len(first_w) > 3:
+        derived.append(" ".join(first_w[:3]))
+    derived.append(f"{first} close up")
+    derived.append(f"{first} wide shot")
+
+    seen = {r.lower() for r in row}
+    for d in derived:
+        if len(row) >= 3:
+            break
+        if d.lower() not in seen:
+            row.append(d)
+            seen.add(d.lower())
+
+    return row[:3]
+
+
+def _build_keywords_prompt(
+    indices:       list[int],
+    sentences:     list[str],
+    tags:          list[str],
+    title:         str,
+    context:       dict,
+    offset:        int,
+    all_sentences: list[str],
+    lang_name:     str,
+) -> str:
+    """✅ v8.0 — برومبت الكلمات المفتاحية (معنى → مشهد مرئي)."""
     content_type = context.get("content_type", "general")
-    emotion      = context.get(
-        "primary_emotion", "neutral"
-    )
+    emotion      = context.get("primary_emotion", "neutral")
     safe_title   = _safe_title(title, TITLE_SHORT_CHARS)
+    total        = len(all_sentences)
 
-    tokens_per_sentence = 40
-    min_tokens          = 400
-    max_allowed         = 4000
-    calculated_tokens   = max(
-        min_tokens,
-        min(n * tokens_per_sentence, max_allowed),
+    blocks = ""
+    for i in indices:
+        g   = offset + i
+        tag = tags[i] if i < len(tags) else "information"
+
+        prev_s = (
+            _safe_truncate(
+                all_sentences[g - 1], SENTENCE_CONTEXT_CHARS
+            )
+            if g > 0 else "(start of video)"
+        )
+        next_s = (
+            _safe_truncate(
+                all_sentences[g + 1], SENTENCE_CONTEXT_CHARS
+            )
+            if g + 1 < total else "(end of video)"
+        )
+        cur = _safe_truncate(
+            sentences[i], SENTENCE_KEYWORDS_CHARS
+        )
+
+        blocks += (
+            f"Sentence {g + 1} [mood: {tag}]\n"
+            f"  Previous: \"{prev_s}\"\n"
+            f"  TEXT:     \"{cur}\"\n"
+            f"  Next:     \"{next_s}\"\n\n"
+        )
+
+    example = json.dumps(
+        {
+            str(offset + indices[0] + 1): [
+                "woman typing laptop cafe",
+                "hands typing keyboard close",
+                "freelancer working laptop table",
+            ]
+        },
+        ensure_ascii=False,
     )
 
-    topic_examples = _get_topic_examples(content_type)
-    examples_str   = "\n".join(
-        f'  GOOD: "{ex}"' for ex in topic_examples
+    return (
+        f"You are a professional video editor choosing "
+        f"stock footage (Pexels / Pixabay).\n"
+        f"The narration is in {lang_name}. For EACH sentence "
+        f"below, write 3 English search queries that find "
+        f"footage which literally SHOWS what the TEXT says "
+        f"at that exact moment.\n\n"
+        f"Video topic: \"{safe_title}\" | "
+        f"Type: {content_type} | Emotion: {emotion}\n\n"
+        f"=== HOW TO THINK ===\n"
+        f"1. First understand the MEANING of the TEXT "
+        f"(translate it mentally to English).\n"
+        f"2. Decide what a camera would physically see: "
+        f"who, doing what, where, with which objects.\n"
+        f"3. Use Previous/Next only to understand context; "
+        f"the footage is for the TEXT sentence.\n\n"
+        f"=== THE 3 QUERIES ===\n"
+        f"Query 1: the most LITERAL scene (main subject + "
+        f"action + setting from the TEXT).\n"
+        f"Query 2: the same scene with different wording "
+        f"or a different camera angle.\n"
+        f"Query 3: a broader but still clearly related "
+        f"visible scene about the same topic.\n\n"
+        f"=== RULES ===\n"
+        f"- {KEYWORD_MIN_WORDS}-{KEYWORD_MAX_WORDS} words per "
+        f"query, English only, no punctuation.\n"
+        f"- Only things a camera can see: people doing "
+        f"actions, hands, objects, places, screens, "
+        f"animals, nature.\n"
+        f"- NEVER abstract ideas (success, mindset, freedom, "
+        f"energy, journey). Turn them into a concrete visible "
+        f"scene (e.g. success -> \"man celebrating raising "
+        f"arms office\").\n"
+        f"- Do NOT write generic queries like \"person "
+        f"talking to camera\" or \"serious face\".\n"
+        f"- No brand names and no real people's names.\n"
+        f"- Different sentences must get different queries.\n\n"
+        f"=== SENTENCES ({len(indices)} total) ===\n"
+        f"{blocks}"
+        f"=== OUTPUT ===\n"
+        f"Return ONLY a JSON object (no markdown, no "
+        f"explanation). Keys are the sentence numbers, "
+        f"values are arrays of exactly 3 query strings.\n"
+        f"Format example (do NOT copy these words, write "
+        f"queries for the sentences above):\n"
+        f"{example}"
     )
 
-    sentences_text = ""
-    for i, sentence in enumerate(sentences):
-        tag         = (
-            tags[i] if i < len(tags)
-            else "information"
+
+def _request_keyword_rows(
+    indices:       list[int],
+    sentences:     list[str],
+    tags:          list[str],
+    title:         str,
+    context:       dict,
+    offset:        int,
+    all_sentences: list[str],
+    lang_name:     str,
+    batch_num:     int,
+    label:         str,
+    temperature:   float,
+) -> dict[int, list[str]]:
+    """
+    ✅ v8.0 — طلب واحد للموديل لمجموعة جمل، يُرجع فقط الصفوف
+    الصالحة {local_index: [kw,...]}. الفاشل يُترك لإعادة المحاولة.
+    """
+    n = len(indices)
+    prompt = _build_keywords_prompt(
+        indices, sentences, tags, title, context,
+        offset, all_sentences, lang_name,
+    )
+    max_tokens = max(
+        KEYWORDS_MIN_TOKENS,
+        min(n * KEYWORDS_TOKENS_PER_SENTENCE,
+            KEYWORDS_MAX_TOKENS),
+    )
+
+    raw = _call_groq(
+        prompt,
+        max_tokens     = max_tokens,
+        temperature    = temperature,
+        operation_name = (
+            f"Visual Keywords "
+            f"(batch {batch_num}, {label}, {n} sentences)"
+        ),
+    )
+
+    try:
+        data: Any = _parse_json_response(
+            raw, dict, "Visual Keywords"
         )
-        visual_hint = TAG_VISUAL_STYLE.get(
-            tag, DEFAULT_VISUAL_STYLE
-        )
-        safe_sent   = _safe_truncate(
-            sentence, SENTENCE_KEYWORDS_CHARS
-        )
-        sentences_text += (
-            f"Sentence {i + 1}:\n"
-            f"  Emotion tag: [{tag}]\n"
-            f"  Text: \"{safe_sent}\"\n"
-            f"  Visual: {visual_hint}\n\n"
+    except AIEnrichmentError:
+        data = _parse_json_response(
+            raw, list, "Visual Keywords"
         )
 
-    prompt = (
-        f"You are a professional video editor "
-        f"searching stock footage.\n"
-        f"Generate PRACTICAL search keywords "
-        f"for Pexels and Pixabay.\n\n"
-        f"Video topic: \"{safe_title}\"\n"
-        f"Content type: {content_type} | "
-        f"Emotion: {emotion}\n\n"
-        f"=== CRITICAL RULES ===\n"
-        f"1. Keywords must work as REAL search queries\n"
-        f"2. ALWAYS include: person/people/face/hands\n"
-        f"3. Include a clear ACTION or EMOTION word\n"
-        f"4. 3-5 words per keyword\n"
-        f"5. English only\n"
-        f"6. Be SPECIFIC and CONCRETE\n\n"
-        f"=== FORBIDDEN WORDS ===\n"
-        f"mystery, shadows, silence, soul, journey, "
-        f"ethereal, longing, abyss, whisper, darkness, "
-        f"dream, essence\n\n"
-        f"=== GOOD EXAMPLES for {content_type} ===\n"
-        f"{examples_str}\n\n"
-        f"=== BAD EXAMPLES ===\n"
-        f'  BAD: "dark shadows mysterious atmosphere"\n'
-        f'  GOOD: "person serious face talking camera"\n\n'
-        f"=== SENTENCES ({n} total) ===\n"
-        f"{sentences_text}"
-        f"=== OUTPUT (CRITICAL) ===\n"
-        f"Return ONLY a JSON array of {n} arrays "
-        f"(no markdown):\n"
-        f'[["kw1","kw2","kw3"],["kw1","kw2","kw3"]]'
-    )
+    rows: dict[int, list[str]] = {}
+
+    if isinstance(data, dict):
+        by_num: dict[int, Any] = {}
+        for k, v in data.items():
+            m = re.search(r"\d+", str(k))
+            if m:
+                by_num[int(m.group())] = v
+        for i in indices:
+            cleaned = _clean_keyword_row(
+                by_num.get(offset + i + 1)
+            )
+            if len(cleaned) >= 2:
+                rows[i] = cleaned
+    elif isinstance(data, list) and len(data) == n:
+        # الموديل رجّع قائمة بنفس العدد بالترتيب
+        for pos, i in enumerate(indices):
+            cleaned = _clean_keyword_row(data[pos])
+            if len(cleaned) >= 2:
+                rows[i] = cleaned
+
+    return rows
+
+
+def _generate_visual_keywords_batch(
+    sentences:     list[str],
+    title:         str,
+    context:       dict,
+    tags:          list[str],
+    batch_num:     int                  = 1,
+    all_sentences: Optional[list[str]]  = None,
+    offset:        int                  = 0,
+    lang:          str                  = "ar",
+) -> list[list[str]]:
+    """
+    ✅ v8.0 — يولّد 3 استعلامات مرئية لكل جملة.
+
+    - برومبت: معنى الجملة → مشهد ملموس (حرفي / مرادف / أوسع)
+    - سياق: الجملة السابقة والتالية
+    - إعادة محاولة للجمل الفاشلة فقط (KEYWORD_RETRY_ROUNDS)
+    - fallback عام فقط للجملة التي فشلت بعد كل المحاولات
+    - يُرجع دائماً n صفوف (n = عدد الجمل)
+    """
+    n         = len(sentences)
+    lang_name = LANG_NAMES.get(lang, "Arabic")
+
+    if all_sentences is None:
+        all_sentences = sentences
+        offset        = 0
 
     fallbacks = [
         "person serious face talking camera",
@@ -1705,78 +1933,87 @@ def _generate_visual_keywords_batch(
         "confident person speaking direct",
     ]
 
-    raw = ""
-    try:
-        raw  = _call_groq(
-            prompt,
-            max_tokens     = calculated_tokens,
-            temperature    = 0.3,
-            operation_name = (
-                f"Visual Keywords "
-                f"(batch {batch_num}, {n} sentences)"
-            ),
-        )
-        data = _parse_json_response(
-            raw, list, "Visual Keywords"
-        )
-        result: list[list[str]] = []
+    rows:    dict[int, list[str]] = {}
+    pending: list[int]            = list(range(n))
 
-        for i in range(n):
-            tag = (
-                tags[i] if i < len(tags)
-                else "information"
+    for attempt in range(1 + KEYWORD_RETRY_ROUNDS):
+        if not pending:
+            break
+
+        label = (
+            "all" if attempt == 0
+            else f"retry {attempt}: {len(pending)} failed"
+        )
+        temperature = 0.3 if attempt == 0 else 0.5
+
+        try:
+            got = _request_keyword_rows(
+                indices       = pending,
+                sentences     = sentences,
+                tags          = tags,
+                title         = title,
+                context       = context,
+                offset        = offset,
+                all_sentences = all_sentences,
+                lang_name     = lang_name,
+                batch_num     = batch_num,
+                label         = label,
+                temperature   = temperature,
             )
+        except Exception as e:
+            log.warning(
+                "  ⚠️  Keywords batch %d (%s) failed: %s",
+                batch_num, label, str(e)[:120],
+            )
+            got = {}
 
-            if (
-                i < len(data) and
-                isinstance(data[i], list)
-            ):
-                raw_kws = [
-                    str(k).strip()
-                    for k in data[i][:5]
-                    if str(k).strip()
-                ]
-                # ✅ v7.7 — استبعد placeholders وهمية (kw1, kw2...)
-                # قبل ما تدخل فلترة الكلمات المجردة، عشان ما
-                # توصل حرفياً لبحث Pexels عن "kw1".
-                raw_kws = [
-                    k for k in raw_kws
-                    if not _is_placeholder_keyword(k)
-                ]
-                kws = _filter_abstract_keywords(raw_kws)
-                while len(kws) < 3:
-                    fb = fallbacks[len(kws) % 3]
-                    if fb not in kws:
-                        kws.append(fb)
-                    else:
-                        kws.append(
-                            f"person {tag} expression face"
-                        )
-            else:
-                log.debug(
-                    "  ⚠️  Sentence %d using fallback.",
-                    i + 1,
-                )
-                kws = list(fallbacks)
+        rows.update(got)
+        pending = [i for i in pending if i not in rows]
 
-            result.append(kws[:3])
+        if pending and attempt < KEYWORD_RETRY_ROUNDS:
             log.info(
-                "     [%d/%d] [%s] → %s",
-                i + 1, n, tag, kws[:3],
+                "  🔁 Keywords: %d/%d sentences need retry",
+                len(pending), n,
+            )
+            time.sleep(INTER_OPERATION_SLEEP)
+
+    result:        list[list[str]] = []
+    fallback_used: int             = 0
+
+    for i in range(n):
+        tag = tags[i] if i < len(tags) else "information"
+
+        if i in rows:
+            kws = _pad_keyword_row(rows[i])
+        else:
+            fallback_used += 1
+            hint = TAG_VISUAL_STYLE.get(
+                tag, DEFAULT_VISUAL_STYLE
+            )
+            kws = [hint] + [
+                f for f in fallbacks if f != hint
+            ]
+            log.warning(
+                "     [%d/%d] ⚠️ no valid keywords after "
+                "retries → generic fallback",
+                i + 1, n,
             )
 
-        return result
-
-    except Exception as e:
-        log.warning(
-            "  ⚠️  Keywords batch %d failed: %s",
-            batch_num, e,
+        result.append(kws[:3])
+        log.info(
+            "     [%d/%d] [%s] → %s",
+            offset + i + 1, len(all_sentences),
+            tag, kws[:3],
         )
-        if raw:
-            log.debug(
-                "  Raw (first 500): %s", raw[:500]
-            )
-        return [list(fallbacks) for _ in range(n)]
+
+    if fallback_used:
+        log.warning(
+            "  ⚠️  Keywords batch %d: %d/%d sentences "
+            "used generic fallback",
+            batch_num, fallback_used, n,
+        )
+
+    return result
 
 
 def generate_visual_keywords(
@@ -1785,6 +2022,7 @@ def generate_visual_keywords(
     context:      dict,
     tags:         Optional[list[str]] = None,
     content_mode: str                 = "short",
+    lang:         str                 = "ar",
 ) -> list[list[str]]:
     if not sentences:
         raise AIEnrichmentError(
@@ -1819,38 +2057,64 @@ def generate_visual_keywords(
         content_mode == "short" or
         n <= BATCH_SIZE_KEYWORDS
     ):
-        return _generate_visual_keywords_batch(
+        result = _generate_visual_keywords_batch(
             sentences, title, context, tags,
-            batch_num=1,
+            batch_num     = 1,
+            all_sentences = sentences,
+            offset        = 0,
+            lang          = lang,
         )
-
-    log.info(
-        "  📦 Long mode — batching %d sentences "
-        "(batches of %d)",
-        n, BATCH_SIZE_KEYWORDS,
-    )
-    result:    list[list[str]] = []
-    batch_num: int             = 0
-
-    for start in range(0, n, BATCH_SIZE_KEYWORDS):
-        end       = min(start + BATCH_SIZE_KEYWORDS, n)
-        batch_num += 1
-
+    else:
         log.info(
-            "  📦 Keywords Batch [%d-%d/%d]...",
-            start + 1, end, n,
+            "  📦 Long mode — batching %d sentences "
+            "(batches of %d)",
+            n, BATCH_SIZE_KEYWORDS,
         )
-        batch_res = _generate_visual_keywords_batch(
-            sentences[start:end],
-            title,
-            context,
-            tags[start:end],
-            batch_num=batch_num,
-        )
-        result.extend(batch_res)
+        result    = []
+        batch_num = 0
 
-        if end < n:
-            time.sleep(BATCH_SLEEP)
+        for start in range(0, n, BATCH_SIZE_KEYWORDS):
+            end       = min(start + BATCH_SIZE_KEYWORDS, n)
+            batch_num += 1
+
+            log.info(
+                "  📦 Keywords Batch [%d-%d/%d]...",
+                start + 1, end, n,
+            )
+            batch_res = _generate_visual_keywords_batch(
+                sentences[start:end],
+                title,
+                context,
+                tags[start:end],
+                batch_num     = batch_num,
+                all_sentences = sentences,
+                offset        = start,
+                lang          = lang,
+            )
+            result.extend(batch_res)
+
+            if end < n:
+                time.sleep(BATCH_SLEEP)
+
+    # ✅ v8.0 — ضمان: عدد الصفوف = عدد الجمل دائماً
+    default_row = [
+        "person serious face talking camera",
+        "emotional person close up expression",
+        "confident person speaking direct",
+    ]
+    if len(result) != n:
+        log.warning(
+            "  ⚠️  Keywords rows (%d) != sentences (%d) "
+            "— fixing",
+            len(result), n,
+        )
+        if len(result) < n:
+            result = result + [
+                list(default_row)
+                for _ in range(n - len(result))
+            ]
+        else:
+            result = result[:n]
 
     log.info(
         "  ✅ Visual Keywords: %d sentences × 3",
@@ -2896,7 +3160,7 @@ def enrich_record(
     content_mode: str                  = "short",
 ) -> dict:
     """
-    الدالة الرئيسية للإثراء بالـ AI — v7.8
+    الدالة الرئيسية للإثراء بالـ AI — v8.0
 
     ✅ الإصلاحات (v7.5):
       - _fix_multiline_strings()
@@ -2915,8 +3179,12 @@ def enrich_record(
         Captions كلها صارت "graceful" — تفشل بهدوء مع fallback
         بدل ما توقف الفيديو كامل
 
-    ✅ الجديد (v7.8):
+    ✅ (v7.8):
       - العربية = الدارجة المغربية في كل النصوص المولَّدة
+
+    ✅ الجديد (v8.0):
+      - Visual Keywords: معنى الجملة → مشهد مرئي حرفي، مع سياق
+        الجمل المجاورة وإعادة محاولة للجمل الفاشلة فقط
     """
     _validate_lang(lang)
     _validate_mode(content_mode)
@@ -2979,6 +3247,7 @@ def enrich_record(
         context      = analysis,
         tags         = tags,
         content_mode = content_mode,
+        lang         = lang,
     )
     time.sleep(INTER_OPERATION_SLEEP)
 
