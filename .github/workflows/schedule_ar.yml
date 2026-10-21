@@ -182,6 +182,9 @@ jobs:
           search_artifacts: true
           branch: ${{ github.ref_name }}
 
+      - name: Clear AI cache (one time)
+        run: python main.py --clear-ai-cache all
+          
       - name: 🇸🇦 Generate + Publish Arabic
         env:
           GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
