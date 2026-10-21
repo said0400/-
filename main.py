@@ -1015,6 +1015,7 @@ def produce_clean_voice(
         output_path      = f"{output_base}_voice",
         voice_key        = voice_cfg["voice_key"],
         lang             = lang,
+        content_mode = content_mode,
     )
 
     out_dir = Path(output_base).parent
