@@ -76,7 +76,7 @@ TTS_TEMPERATURE_SHORT = 1.0
 TTS_TEMPERATURE_LONG  = 0.7
 
 # ✅ v2.2 — تذكير الإيقاع في الفيديو الطويل: كل N جمل
-LONG_REMINDER_EVERY = 8
+LONG_REMINDER_EVERY = 5
 
 # Words per minute (per language — for truncation detection)
 WPM_BY_LANG: dict[str, int] = {
