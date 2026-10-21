@@ -1,7 +1,12 @@
 """
 🧠 Smart AI Assistant powered by Groq — Final Stable Version v8.0
 
-Changes in v8.0 (NEW) — Visual Keywords relevance overhaul:
+Changes in v8.1 (NEW):
+  ✅ الكلمات المفتاحية البصرية تُولَّد بـ Gemini (gemini-2.5-flash ثم
+     flash-lite) بنفس مفاتيح TTS، مع fallback تلقائي إلى Groq.
+     KEYWORDS_PROVIDER=groq لإيقافه.
+
+Changes in v8.0 — Visual Keywords relevance overhaul:
   ✅ 1. برومبت الكلمات المفتاحية أُعيد كتابته: يفهم معنى الجملة
         (دارجة/فرنسية/عربية) ثم يكتب 3 استعلامات إنجليزية مرئية
         (حرفي → مرادف → أوسع من نفس الموضوع) بدل "person + emotion".
@@ -1235,6 +1240,191 @@ def _call_groq(
         f"   Last error: {last_error[:200] if last_error else '?'}"
     )
 
+# ═══════════════════════════════════════════════════════════════
+# ✅ v8.1 — GEMINI للكلمات المفتاحية (مع fallback إلى Groq)
+# ═══════════════════════════════════════════════════════════════
+# يستعمل نفس مفاتيح GEMINI_API_KEY / GEMINI_API_KEY1.. / GEMINI_API_KEY_1..
+# المستعملة في tts.py (نموذج نصي مختلف عن نموذج TTS، فحصته مستقلة).
+# للتحكم من YML:  KEYWORDS_PROVIDER=gemini (الافتراضي) أو groq
+
+try:
+    from google import genai as _genai
+    from google.genai import types as _gtypes
+except Exception:  # المكتبة غير مثبتة → Groq فقط
+    _genai  = None
+    _gtypes = None
+
+KEYWORDS_PROVIDER = os.environ.get(
+    "KEYWORDS_PROVIDER", "gemini"
+).strip().lower()
+
+# بالترتيب: الأقوى أولاً ثم الأخف عند نفاد الحصة
+GEMINI_KEYWORD_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+GEMINI_RATE_WAIT = 5.0
+
+_gemini_keys:   list[str]       = []
+_gemini_index:  int             = 0
+_gemini_lock:   threading.RLock = threading.RLock()
+_gemini_loaded: bool            = False
+_gemini_clients: dict           = {}
+
+
+def _load_gemini_keys() -> list[str]:
+    keys: list[str] = []
+    seen: set[str]  = set()
+    main = os.environ.get("GEMINI_API_KEY", "").strip()
+    if main:
+        keys.append(main)
+        seen.add(main)
+    for i in range(1, MAX_KEYS_SCAN + 1):
+        for name in (f"GEMINI_API_KEY{i}", f"GEMINI_API_KEY_{i}"):
+            k = os.environ.get(name, "").strip()
+            if k and k not in seen:
+                keys.append(k)
+                seen.add(k)
+    return keys
+
+
+def _ensure_gemini_loaded() -> None:
+    global _gemini_keys, _gemini_loaded
+    if _gemini_loaded:
+        return
+    with _gemini_lock:
+        if _gemini_loaded:
+            return
+        _gemini_keys   = _load_gemini_keys()
+        _gemini_loaded = True
+        if _gemini_keys:
+            log.info(
+                "  \U0001F511 Loaded %d Gemini keys (keywords)",
+                len(_gemini_keys),
+            )
+
+
+def _gemini_client(key: str):
+    with _gemini_lock:
+        if key not in _gemini_clients:
+            _gemini_clients[key] = _genai.Client(api_key=key)
+        return _gemini_clients[key]
+
+
+def _gemini_config(max_tokens: int, temperature: float):
+    kwargs = dict(
+        temperature        = temperature,
+        max_output_tokens  = max_tokens,
+        response_mime_type = "application/json",
+    )
+    try:  # بدون "تفكير" حتى لا تستهلك التوكنز
+        return _gtypes.GenerateContentConfig(
+            thinking_config = _gtypes.ThinkingConfig(
+                thinking_budget=0
+            ),
+            **kwargs,
+        )
+    except Exception:
+        return _gtypes.GenerateContentConfig(**kwargs)
+
+
+def _call_gemini(
+    prompt:         str,
+    max_tokens:     int,
+    temperature:    float,
+    operation_name: str,
+) -> str:
+    global _gemini_index
+
+    if _genai is None:
+        raise AIEnrichmentError("google-genai not installed")
+    _ensure_gemini_loaded()
+    if not _gemini_keys:
+        raise AIEnrichmentError("No Gemini API keys found")
+
+    n          = len(_gemini_keys)
+    last_error = ""
+
+    for model in GEMINI_KEYWORD_MODELS:
+        rate_limited = 0
+        for _ in range(n):
+            with _gemini_lock:
+                idx = _gemini_index % n
+                key = _gemini_keys[idx]
+            try:
+                log.info(
+                    "  \U0001F916 %s [gemini key#%d/%d model=%s]...",
+                    operation_name, idx + 1, n, model,
+                )
+                resp = _gemini_client(key).models.generate_content(
+                    model    = model,
+                    contents = prompt,
+                    config   = _gemini_config(
+                        max_tokens, temperature
+                    ),
+                )
+                text = (getattr(resp, "text", None) or "").strip()
+                if text:
+                    return text
+                last_error = "empty response"
+            except Exception as e:
+                last_error = str(e)
+                low = last_error.lower()
+                if _is_rate_limit_error(last_error):
+                    rate_limited += 1
+                    log.warning(
+                        "  \U0001F6D1 Gemini rate limit key#%d",
+                        idx + 1,
+                    )
+                elif "404" in low or "not found" in low:
+                    log.warning(
+                        "  \u26a0\ufe0f  Gemini model '%s' unavailable",
+                        model,
+                    )
+                    break  # انتقل للنموذج التالي
+                else:
+                    log.warning(
+                        "  \u26a0\ufe0f  Gemini error: %s",
+                        last_error[:100],
+                    )
+            # جرّب المفتاح التالي
+            with _gemini_lock:
+                _gemini_index = (_gemini_index + 1) % n
+
+        if rate_limited >= n:
+            time.sleep(GEMINI_RATE_WAIT)
+
+    raise AIEnrichmentError(
+        f"{operation_name}: Gemini failed — {last_error[:150]}"
+    )
+
+
+def _call_keywords_llm(
+    prompt:         str,
+    max_tokens:     int   = 800,
+    temperature:    float = 0.3,
+    operation_name: str   = "Keywords",
+) -> str:
+    """Gemini أولاً للكلمات المفتاحية، ثم Groq كاحتياط."""
+    if KEYWORDS_PROVIDER == "gemini":
+        try:
+            return _call_gemini(
+                prompt, max_tokens, temperature, operation_name
+            )
+        except Exception as e:
+            log.warning(
+                "  \u26a0\ufe0f  Gemini keywords failed (%s) "
+                "\u2014 falling back to Groq",
+                str(e)[:120],
+            )
+    return _call_groq(
+        prompt,
+        max_tokens     = max_tokens,
+        temperature    = temperature,
+        operation_name = operation_name,
+    )
+
+
 # ═══════════════════════════════════════════════════
 # DATA EXTRACTION HELPERS
 # ═══════════════════════════════════════════════════
@@ -1858,7 +2048,7 @@ def _request_keyword_rows(
             KEYWORDS_MAX_TOKENS),
     )
 
-    raw = _call_groq(
+    raw = _call_keywords_llm(
         prompt,
         max_tokens     = max_tokens,
         temperature    = temperature,
