@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-🎬 Video Generator — Multi-Language Auto Publisher v3.5
+🎬 Video Generator — Multi-Language Auto Publisher v3.7
+
+Changes from v3.6:
+  ✅ 1. music_volume 0.12 → 0.05 (مع سقف في audio_manager).
+  ✅ 2. _sentence_spans() + _rotate(): حدود مطلقة لكل جملة.
+  ✅ 3. _build_clip_plan (قصير): المقطع ينتهي عند حد جملته المطلق
+        (لا انحراف تراكمي)، والجملة الطويلة تُقسَّم بدل أن تُقصّ.
+  ✅ 4. _build_background_chunks (طويل): كل مقطع داخل حدود جملته
+        ويستعمل كلماتها (min(i, n-1) بدل modulo).
+  ✅ 5. حارس: visual_keywords ≠ عدد الجمل → تحذير في اللوج.
 
 Changes from v3.5:
   ✅ process_tagged_content يستلم content_mode، والكاش يُعتبر قديماً
      إذا اختلف عدد الجمل، ولا تُولَّد صورة مصغرة لفيديو فاشل.
 
-Changes from v3.4:
+Changes from v3.5 (older):
   ✅ 1. _align_script_to_timings() — الكلمات المعروضة = نص السكريبت،
         وWhisper للتوقيت فقط (يحل عدم تطابق النص مع الصوت).
   ✅ 2. VSG_DISABLE_FACEBOOK=1 (من YML) → فيديو يوتيوب فقط.
@@ -118,6 +127,9 @@ FFMPEG_TIMEOUT       = 300
 MIN_CLIP_DUR         = 0.8
 MAX_SINGLE_CLIP_DUR  = 15.0
 AUDIO_SYNC_TOLERANCE = 2.0
+
+# ✅ v3.7 — مستوى الموسيقى (audio_manager يضع سقفاً أيضاً)
+MUSIC_VOLUME         = 0.05
 
 RENDER_TIMEOUT_SHORT   = 1800
 RENDER_TIMEOUT_LONG_YT = 7200
@@ -633,6 +645,39 @@ def _normalize_keywords_row(
 
 
 # ═══════════════════════════════════════════════════
+# ✅ v3.7 — SENTENCE SPANS (حدود مطلقة لكل جملة)
+# ═══════════════════════════════════════════════════
+
+def _sentence_spans(
+    aligned:   list[dict],
+    n:         int,
+    total_dur: float,
+) -> list[tuple[float, float]]:
+    """
+    حدود مطلقة لكل جملة: الأولى تبدأ من 0 والأخيرة تنتهي عند
+    total_dur. بداية كل جملة = بداية جملتها في التوقيت، ونهايتها
+    = بداية التي بعدها، فلا فجوات ولا تراكم انحراف.
+    """
+    starts = [0.0]
+    for i in range(1, n):
+        s = float(aligned[i].get("start", 0))
+        starts.append(max(s, starts[-1]))
+    starts.append(float(total_dur))
+    return [
+        (starts[i], max(starts[i], starts[i + 1]))
+        for i in range(n)
+    ]
+
+
+def _rotate(row: list[str], j: int) -> list[str]:
+    """تدوير الكلمات المفتاحية (للمقاطع المتعددة لنفس الجملة)."""
+    if not row:
+        return row
+    j %= max(1, len(row))
+    return row[j:] + row[:j]
+
+
+# ═══════════════════════════════════════════════════
 # BACKGROUND CHUNKS
 # ═══════════════════════════════════════════════════
 
@@ -656,12 +701,14 @@ def _build_background_chunks(
     total_dur:       float,
     chunk_dur:       float,
 ) -> tuple[list[list[str]], list[float]]:
+    """
+    ✅ v3.7 — كل مقطع داخل حدود جملته ويستعمل كلماتها هي.
+    """
     if total_dur <= 0:
         log.warning("  ⚠️  total_dur <= 0")
         return [], []
 
     chunk_dur  = max(0.5, chunk_dur)
-    MAX_CHUNKS = int(total_dur / 0.5) + 10
     default_kw = ["person serious face talking camera"]
 
     if not visual_keywords:
@@ -679,52 +726,37 @@ def _build_background_chunks(
 
     chunks_kw:  list[list[str]] = []
     chunks_dur: list[float]     = []
-    t          = 0.0
-    iter_count = 0
-
-    # ✅ v3.2 — عدد visual_keywords للـ modulo
     n_visual = len(visual_keywords)
+    n_sent   = len(aligned) if aligned else 0
 
-    while (
-        t < total_dur - 0.05 and
-        iter_count < MAX_CHUNKS
-    ):
-        iter_count += 1
-        remaining   = total_dur - t
-        dur = (
-            remaining
-            if remaining <= chunk_dur * 1.5
-            else chunk_dur
-        )
-        dur = max(0.5, round(dur, 3))
-
-        mid_time = t + dur / 2.0
-        sent_idx = _find_active_sentence_idx(
-            aligned, mid_time
+    if n_sent == 0:
+        n = max(1, int(total_dur / chunk_dur))
+        return (
+            [list(visual_keywords[0])] * n,
+            [round(total_dur / n, 3)] * n,
         )
 
-        # ✅ v3.2 — modulo لمنع fallback عند chunks > keywords
-        kw = (
-            visual_keywords[sent_idx % n_visual]
-            if n_visual > 0
-            else default_kw
+    spans = _sentence_spans(aligned, n_sent, total_dur)
+    for i, (s, e) in enumerate(spans):
+        span = e - s
+        if span < 0.5:
+            # جملة قصيرة جداً: تُضاف مدتها للمقطع السابق
+            if chunks_dur:
+                chunks_dur[-1] += span
+            continue
+        k   = max(1, round(span / chunk_dur))
+        row = _normalize_keywords_row(
+            visual_keywords[min(i, n_visual - 1)], i
         )
-
-        chunks_kw.append(kw)
-        chunks_dur.append(dur)
-        t += dur
-
-    if iter_count >= MAX_CHUNKS:
-        log.warning(
-            "  ⚠️  MAX_CHUNKS reached: %d", iter_count
-        )
+        for j in range(k):
+            chunks_kw.append(_rotate(row, j))
+            chunks_dur.append(round(span / k, 3))
 
     if chunks_dur:
         diff = round(total_dur - sum(chunks_dur), 3)
-        if abs(diff) > 0.01:
-            chunks_dur[-1] = max(
-                0.5, round(chunks_dur[-1] + diff, 3)
-            )
+        chunks_dur[-1] = max(
+            0.5, round(chunks_dur[-1] + diff, 3)
+        )
 
     n_chunks = len(chunks_dur)
     avg_dur  = (
@@ -829,73 +861,56 @@ def _build_clip_plan(
         return row
 
     if aligned and len(aligned) >= len(sentences):
+        # ✅ v3.7 — المقطع ينتهي عند حد جملته المطلق، فأي خطأ
+        # يُصحَّح في المقطع التالي ولا يتراكم.
         log.info(
-            "\n  🎞️  Clip plan from WhisperX "
+            "\n  🎞️  Clip plan from timings "
             "(%d sentences)",
             len(sentences),
         )
-        for i in range(len(sentences)):
-            cs = float(aligned[i].get("start", 0.0))
-            ce = float(aligned[i].get("end",   cs))
-
-            if (
-                i < len(sentences) - 1 and
-                (i + 1) < len(aligned)
-            ):
-                ns  = float(
-                    aligned[i + 1].get("start", ce)
-                )
-                eff = max(ce, ns)
-                dur = min(
-                    max(MIN_CLIP_DUR,
-                        round(eff - cs, 3)),
-                    MAX_SINGLE_CLIP_DUR,
-                )
-            else:
-                used      = sum(clip_durations)
-                remaining = max(
-                    MIN_CLIP_DUR,
-                    round(total_dur - used, 3),
-                )
-                est = (
-                    estimated[i]
-                    if i < len(estimated)
-                    else CLIP_DURATION
-                )
-                dur = min(
-                    max(MIN_CLIP_DUR, round(est, 3)),
-                    remaining,
-                )
-
-            clip_keywords.append(_make_row(i))
-            clip_durations.append(dur)
-            log.info(
-                "     [%d/%d] [%s] %.2fs → %s",
-                i + 1, len(sentences),
-                aligned[i].get("tag", "info"),
-                dur, clip_keywords[-1][0],
+        spans = _sentence_spans(
+            aligned, len(sentences), total_dur
+        )
+        t = 0.0
+        for i, (s, e) in enumerate(spans):
+            span = e - s
+            # الجملة الطويلة تُقسَّم لعدة مقاطع بدل أن تُقصّ
+            parts = max(
+                1,
+                int(-(-span // MAX_SINGLE_CLIP_DUR)),
             )
-
-        total_clips = sum(clip_durations)
-        if (
-            total_clips > 0 and
-            abs(total_clips - total_dur) > 1.0
-        ):
-            scale          = total_dur / total_clips
-            clip_durations = [
-                max(MIN_CLIP_DUR, round(d * scale, 3))
-                for d in clip_durations
-            ]
-            if clip_durations:
-                diff = round(
-                    total_dur - sum(clip_durations), 3
+            base_row = _make_row(i)
+            for j in range(parts):
+                part_end = s + span * (j + 1) / parts
+                is_last  = (
+                    i == len(spans) - 1 and
+                    j == parts - 1
                 )
-                clip_durations[-1] = max(
-                    MIN_CLIP_DUR,
-                    round(
-                        clip_durations[-1] + diff, 3
-                    ),
+                dur = (
+                    total_dur - t
+                    if is_last
+                    else max(MIN_CLIP_DUR, part_end - t)
                 )
+                if dur < 0.3 and clip_durations:
+                    clip_durations[-1] = round(
+                        clip_durations[-1] +
+                        max(0.0, dur),
+                        3,
+                    )
+                else:
+                    clip_keywords.append(
+                        _rotate(base_row, j)
+                    )
+                    clip_durations.append(
+                        round(max(dur, 0.1), 3)
+                    )
+                    log.info(
+                        "     [%d/%d] [%s] %.2fs → %s",
+                        i + 1, len(sentences),
+                        aligned[i].get("tag", "info"),
+                        dur, clip_keywords[-1][0],
+                    )
+                t += max(0.0, dur)
 
         return clip_keywords, clip_durations
 
@@ -1182,7 +1197,8 @@ def produce_mixed_audio(
             output_path    = mixed_out,
             clip_durations = clip_dur_list,
             sfx_type       = "swoosh",
-            music_volume   = 0.12,
+            # ✅ v3.7 — الموسيقى أخفض (كانت 0.12)
+            music_volume   = MUSIC_VOLUME,
             seed           = (
                 hash(script_data["title"]) % 10000
             ),
@@ -1719,6 +1735,14 @@ def get_or_create_ai_data(
         verbose      = True,
         content_mode = content_mode,
     )
+
+    # ✅ v3.7 — حارس: عدد صفوف الكلمات المفتاحية = عدد الجمل
+    n_kw = len(enriched.get("visual_keywords", []) or [])
+    if n_kw != len(tagged):
+        log.warning(
+            "  ⚠️  visual_keywords=%d vs sentences=%d",
+            n_kw, len(tagged),
+        )
 
     save_ai_cache(
         cache_key    = cache_key,
@@ -2605,6 +2629,7 @@ def _run_short_pipeline(
         clip_durations        = clip_durations,
         output_dir            = vid_dir,
         content_mode          = "short",
+        aligned               = aligned,
     )
     result["video_paths"] = [
         str(p) for p in video_paths
@@ -3190,9 +3215,6 @@ def _generate_video_thumbnail(
         log.warning("  ⚠️  Pre-publish thumbnail error: %s", e)
 
     return ""
-
-
-
 
 
 # ═══════════════════════════════════════════════════
