@@ -1,5 +1,5 @@
 """
-🎙️ Text-to-Speech via Google Gemini TTS v2.1 — Street Style Edition
+🎙️ Text-to-Speech via Google Gemini TTS v2.2 — Street Style Edition
 
 Features:
   ✅ Per-language voices (different voice for each lang)
@@ -19,7 +19,16 @@ Features:
   ✅ Compatible with google-genai 0.x and 1.x
   ✅ Reliable MIME → extension mapping
 
-Changes in v2.1 (NEW):
+Changes in v2.2 (NEW) — منع تسارع الصوت في الفيديو الطويل:
+  ✅ synthesize_speech(content_mode=...) — "short" (الافتراضي) أو "long".
+  ✅ الطويل: سطر تذكير إيقاع [PACE CHECK ...] داخل النص كل
+     LONG_REMINDER_EVERY جمل، حتى تبقى التعليمات قريبة من الموضع
+     الذي يقرؤه الموديل (بدل أن تكون بعيدة في أول البرومبت).
+  ✅ الطويل: temperature = 0.7 (القصير يبقى 1.0).
+  ✅ قاعدة في البرومبت: أسطر [PACE CHECK] تعليمات للمخرج ولا تُنطق.
+  ✅ القصير: لا تغيير إطلاقاً في السلوك.
+
+Changes in v2.1:
   ✅ العربية = الدارجة المغربية (بدل اللهجة السعودية)
   ✅ العربية: وتيرة بطيئة وواضحة دائماً (PACE OVERRIDE يتجاوز
      تعليمات الوسوم التي تطلب سرعة أعلى مثل urgency/shock)
@@ -61,6 +70,13 @@ MAX_KEYS_SCAN  = 50
 
 # Timeouts
 FFPROBE_TIMEOUT = 15
+
+# ✅ v2.2 — Temperature (الطويل أثبت لتقليل الانحراف مع الطول)
+TTS_TEMPERATURE_SHORT = 1.0
+TTS_TEMPERATURE_LONG  = 0.7
+
+# ✅ v2.2 — تذكير الإيقاع في الفيديو الطويل: كل N جمل
+LONG_REMINDER_EVERY = 8
 
 # Words per minute (per language — for truncation detection)
 WPM_BY_LANG: dict[str, int] = {
@@ -578,13 +594,56 @@ def _build_tags_legend(tagged_sentences: list[dict]) -> str:
     return "\n\n".join(legend_parts)
 
 
-def _build_script_text(tagged_sentences: list[dict]) -> str:
-    """Build script text with tags."""
+def _get_pace_reminder(lang: str) -> str:
+    """
+    ✅ v2.2 — سطر تذكير الإيقاع (للفيديو الطويل فقط).
+
+    يُكتب بصيغة تعليمات المخرج بين أقواس، ويُعلَن في البرومبت
+    أنه لا يُنطق أبداً.
+    """
+    if lang == "ar":
+        body = (
+            "Keep the SAME slow, clear Moroccan pace as the very "
+            "first sentence. Do NOT speed up. Same calm rhythm, "
+            "same natural pauses."
+        )
+    else:
+        body = (
+            "Keep the SAME delivery speed as the very first "
+            "sentence. Do NOT accelerate. Same rhythm, same "
+            "natural pauses."
+        )
+    return f"[PACE CHECK — director instruction, do NOT read aloud: {body}]"
+
+
+def _build_script_text(
+    tagged_sentences: list[dict],
+    lang:             str = "ar",
+    content_mode:     str = "short",
+) -> str:
+    """
+    Build script text with tags.
+
+    ✅ v2.2 — في الفيديو الطويل يُدخل سطر تذكير إيقاع كل
+    LONG_REMINDER_EVERY جمل (ليس بعد الجملة الأخيرة).
+    القصير: نفس السلوك القديم تماماً.
+    """
     lines = []
-    for sent in tagged_sentences:
+    total = len(tagged_sentences)
+    use_reminders = (content_mode == "long")
+    reminder = _get_pace_reminder(lang) if use_reminders else ""
+
+    for i, sent in enumerate(tagged_sentences):
         tag  = sent.get("final_tag", DEFAULT_TAG)
         text = sent["text"]
         lines.append(f"[{tag}] {text}")
+
+        if (
+            use_reminders
+            and (i + 1) % LONG_REMINDER_EVERY == 0
+            and (i + 1) < total
+        ):
+            lines.append(reminder)
 
     return "\n\n".join(lines)
 
@@ -592,6 +651,7 @@ def _build_script_text(tagged_sentences: list[dict]) -> str:
 def _build_tagged_prompt(
     tagged_sentences: list[dict],
     lang:             str,
+    content_mode:     str = "short",
 ) -> str:
     """Build comprehensive prompt with director's note + tags."""
     if not tagged_sentences:
@@ -601,7 +661,9 @@ def _build_tagged_prompt(
     director_note = config["director_note"]
     lang_note     = _get_lang_note(lang)
     legend_text   = _build_tags_legend(tagged_sentences)
-    script_text   = _build_script_text(tagged_sentences)
+    script_text   = _build_script_text(
+        tagged_sentences, lang, content_mode
+    )
     n             = len(tagged_sentences)
 
     # ✅ v2.1 — العربية: وتيرة بطيئة وواضحة تتجاوز تعليمات
@@ -632,6 +694,28 @@ def _build_tagged_prompt(
             "- Last sentence: Deliver with complete conviction"
         )
 
+    # ✅ v2.2 — شرح أسطر التذكير (الطويل فقط)
+    if content_mode == "long":
+        pace_check_rule = (
+            "\n# PACE CHECK LINES\n"
+            "Some lines in the transcript start with "
+            "[PACE CHECK — ...]. They are silent director "
+            "instructions: NEVER read them aloud, NEVER pause "
+            "extra for them. Just follow them: the transcript "
+            "is LONG, so keep the SAME speaking speed from the "
+            "first sentence to the very last one. Do not "
+            "gradually speed up.\n"
+        )
+        extra_rule = (
+            "\n8. Lines starting with [PACE CHECK] are NOT text — "
+            "never speak them\n"
+            "9. Speaking speed at the END must equal speaking "
+            "speed at the START"
+        )
+    else:
+        pace_check_rule = ""
+        extra_rule      = ""
+
     return f"""Read the following transcript with AUTHENTIC street accent and emotion.
 
 {director_note}
@@ -645,7 +729,7 @@ DO NOT speak the tag — read ONLY the text after it.
 CHANGE your voice style for each different tag.
 
 {legend_text}
-{pace_override}
+{pace_override}{pace_check_rule}
 {pacing_guide}
 
 # Transcript
@@ -658,7 +742,7 @@ CHANGE your voice style for each different tag.
 4. Make transitions feel natural and emotional
 5. Use AUTHENTIC street accent as specified in director note
 6. NEVER switch to formal/literary pronunciation
-7. Sound like a REAL person, not an AI"""
+7. Sound like a REAL person, not an AI{extra_rule}"""
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -764,11 +848,12 @@ def _to_wav(audio_data: bytes, mime_type: str) -> bytes:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _build_tts_config(
-    voice_name: str,
+    voice_name:  str,
+    temperature: float = TTS_TEMPERATURE_SHORT,
 ) -> "types.GenerateContentConfig":
     """Build Gemini TTS configuration."""
     return types.GenerateContentConfig(
-        temperature         = 1.0,
+        temperature         = temperature,
         response_modalities = ["audio"],
         speech_config       = types.SpeechConfig(
             voice_config = types.VoiceConfig(
@@ -919,6 +1004,7 @@ def synthesize_speech(
     voice_key:        str = "",
     lang:             str = "ar",
     retries:          int = 3,
+    content_mode:     str = "short",
 ) -> Path:
     """
     Convert tagged sentences to speech via Gemini TTS.
@@ -927,6 +1013,8 @@ def synthesize_speech(
     ✅ Per-language voice selection
     ✅ Authentic street accent prompting
     ✅ Language-aware truncation detection
+    ✅ v2.2: long mode → pace reminders inside the text
+             + lower temperature (anti speed-drift)
     
     Args:
         tagged_sentences: list of dicts with "text" and "final_tag"
@@ -934,6 +1022,7 @@ def synthesize_speech(
         voice_key:        unused (auto-selected from VOICE_CONFIGS)
         lang:             ar | fr | en
         retries:          base retry count (may be increased with more keys)
+        content_mode:     "short" (default) | "long"
     
     Returns:
         Path to saved audio file
@@ -946,6 +1035,8 @@ def synthesize_speech(
         raise ValueError("No tagged sentences to synthesize")
 
     _ensure_keys_loaded()
+
+    is_long = (content_mode == "long")
 
     # Get voice config for language (per-language)
     config     = VOICE_CONFIGS.get(lang, VOICE_CONFIGS["ar"])
@@ -963,7 +1054,9 @@ def synthesize_speech(
     }
 
     # Build prompt
-    prompt = _build_tagged_prompt(tagged_sentences, lang)
+    prompt = _build_tagged_prompt(
+        tagged_sentences, lang, content_mode
+    )
 
     # Calculate max attempts
     max_attempts = max(
@@ -973,10 +1066,20 @@ def synthesize_speech(
         else retries
     )
 
+    temperature = (
+        TTS_TEMPERATURE_LONG if is_long
+        else TTS_TEMPERATURE_SHORT
+    )
+    n_reminders = (
+        max(0, (len(tagged_sentences) - 1) // LONG_REMINDER_EVERY)
+        if is_long else 0
+    )
+
     # Log configuration
     log.info("\n  🎙️  TTS Configuration:")
     log.info("     Voice    : %s (%s)", voice_name, voice_key)
     log.info("     Lang     : %s", lang.upper())
+    log.info("     Mode     : %s", content_mode.upper())
     log.info(
         "     Style    : %s",
         "Moroccan Darija (slow & clear)"
@@ -989,11 +1092,17 @@ def synthesize_speech(
         ", ".join(sorted(unique_tags))
     )
     log.info("     Sentences: %d", len(tagged_sentences))
+    log.info("     Temp     : %.2f", temperature)
+    if is_long:
+        log.info(
+            "     Pace chk : %d reminders (every %d sentences)",
+            n_reminders, LONG_REMINDER_EVERY,
+        )
     log.info("     Keys     : %d available", len(_API_KEYS))
     log.info("     Max tries: %d", max_attempts)
 
     # Build TTS config
-    tts_config = _build_tts_config(voice_name)
+    tts_config = _build_tts_config(voice_name, temperature)
 
     # Generation attempts
     for attempt in range(max_attempts):
@@ -1073,6 +1182,13 @@ def synthesize_speech(
                 # On last attempt, accept what we have
 
             # Success!
+            if total_words > 0 and duration > 0:
+                log.info(
+                    "  📏 Average speed: %.2f words/sec "
+                    "(%.0f WPM)",
+                    total_words / duration,
+                    total_words / duration * 60,
+                )
             return saved
 
         except Exception as e:
